@@ -105,7 +105,16 @@ WINDOW_OPTIONS = ["All", "30 s", "1 min", "5 min", "10 min", "30 min"]
 ALICAT_BAUD    = 19200
 ALICAT_BAUDS   = ["9600", "19200", "38400", "57600", "115200"]
 ALICAT_CSV_COLS = ["timestamp", "pressure_bar", "temperature_C",
-                   "vol_flow_slm", "mass_flow_slm", "setpoint", "gas"]
+                   "vol_flow_slm", "mass_flow_slm", "setpoint", "gas"]   # legacy
+
+# Unified log — one file for frequency + both Alicats, always the same columns.
+# Missing/disconnected channels are written as empty strings.
+UNIFIED_CSV_COLS = [
+    "timestamp",
+    "freq_hz",
+    "pressure_bar_A", "temperature_C_A", "vol_flow_slm_A", "mass_flow_slm_A", "setpoint_A", "gas_A",
+    "pressure_bar_B", "temperature_C_B", "vol_flow_slm_B", "mass_flow_slm_B", "setpoint_B", "gas_B",
+]
 
 import matplotlib as _mpl
 _mpl.rcParams.update({
@@ -273,22 +282,38 @@ def load_picoscope_csv(path: str | Path) -> pd.DataFrame:
 
 # ── Alicat CSV file loader ─────────────────────────────────────────────────
 
-def load_alicat_csv(path: str | Path) -> pd.DataFrame:
-    """Load a previously-saved Alicat log CSV and normalise column names to
+def load_alicat_csv(path: str | Path, unit: str = "A") -> pd.DataFrame:
+    """Load a unified or legacy Alicat log CSV and normalise column names to
     match the live-polling format used internally (pressure, temperature,
-    vol_flow, mass_flow, setpoint, gas)."""
+    vol_flow, mass_flow, setpoint, gas).
+
+    *unit* selects which Alicat to extract from a unified file ("A" or "B").
+    """
     df = pd.read_csv(path, encoding="utf-8-sig", on_bad_lines="skip")
-    # Rename saved-log column names → internal names
-    rename = {
-        "pressure_bar":    "pressure",
-        "temperature_C":   "temperature",
-        "vol_flow_slm":    "vol_flow",
-        "mass_flow_slm":   "mass_flow",
-    }
-    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
 
     if "timestamp" not in df.columns:
         raise ValueError("CSV does not contain a 'timestamp' column.")
+
+    # Detect unified format (has _A / _B suffixed columns)
+    if f"pressure_bar_{unit}" in df.columns:
+        suffix = f"_{unit}"
+        rename = {
+            f"pressure_bar{suffix}":  "pressure",
+            f"temperature_C{suffix}": "temperature",
+            f"vol_flow_slm{suffix}":  "vol_flow",
+            f"mass_flow_slm{suffix}": "mass_flow",
+            f"setpoint{suffix}":      "setpoint",
+            f"gas{suffix}":           "gas",
+        }
+    else:
+        # Legacy single-unit format
+        rename = {
+            "pressure_bar":  "pressure",
+            "temperature_C": "temperature",
+            "vol_flow_slm":  "vol_flow",
+            "mass_flow_slm": "mass_flow",
+        }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
@@ -529,11 +554,14 @@ class MASMonitor(tk.Tk):
         self._alicats: list[AlicatLogger] = [AlicatLogger(""), AlicatLogger("")]
         self._alicat = self._alicats[0]   # backward-compat alias
 
-        # Per-Alicat logging state
-        self._alicat_logging: list[bool] = [False, False]
-        self._alicat_csv_path: list = [None, None]
+        # Unified log (frequency + both Alicats → one CSV)
+        self._unified_logging:    bool          = False
+        self._unified_csv_path:   Path | None   = None
+        self._unified_log_fh                    = None
+        self._unified_log_writer                = None
+        self._unified_log_rows:   int           = 0
 
-        # Shared file-load (Alicat A for legacy scatter/export)
+        # Shared file-load (unified or legacy Alicat CSV for scatter/export)
         self._alicat_file_df:  pd.DataFrame = pd.DataFrame()
         self._alicat_file_path: Path | None = None
 
