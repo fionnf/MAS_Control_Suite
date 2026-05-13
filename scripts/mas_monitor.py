@@ -1397,6 +1397,219 @@ class MASMonitor(tk.Tk):
 
         _refresh()
 
+    # ── Spin routines ──────────────────────────────────────────────────────
+
+    def _open_routine_editor(self):
+        """Toplevel window for editing spin-up and spin-down step sequences."""
+        win = tk.Toplevel(self)
+        win.title("Edit spin routines")
+        win.configure(bg=BG)
+        win.geometry("700x480")
+        win.resizable(True, True)
+
+        tk.Label(win, text="Define step sequences  (setpoint → hold for duration, then next step)",
+                 bg=BG, fg=FG_DIM, font=FONT_SM, anchor="w").pack(fill="x", padx=12, pady=(8, 4))
+
+        pane = tk.Frame(win, bg=BG)
+        pane.pack(fill="both", expand=True, padx=8, pady=4)
+        pane.columnconfigure(0, weight=1)
+        pane.columnconfigure(1, weight=1)
+
+        def _make_table(parent, title, steps_ref, colour):
+            """Build an editable step table inside *parent*."""
+            grp = _group(parent, title)
+            grp.grid(sticky="nsew", padx=4, pady=2)
+
+            hdr = tk.Frame(grp, bg=LFR_BG)
+            hdr.pack(fill="x", padx=8, pady=(4, 0))
+            for txt, w in [("Step", 4), ("Setpoint (slm)", 14), ("Duration (s)", 12)]:
+                tk.Label(hdr, text=txt, bg=LFR_BG, fg=FG_DIM,
+                         font=FONT_SM, anchor="w", width=w).pack(side="left", padx=(0, 4))
+
+            # Scrollable rows
+            canvas = tk.Canvas(grp, bg=LFR_BG, highlightthickness=0, height=240)
+            vsb = ttk.Scrollbar(grp, orient="vertical", command=canvas.yview)
+            canvas.configure(yscrollcommand=vsb.set)
+            vsb.pack(side="right", fill="y", padx=(0, 4))
+            canvas.pack(fill="both", expand=True, padx=8)
+
+            inner = tk.Frame(canvas, bg=LFR_BG)
+            canvas_win = canvas.create_window((0, 0), window=inner, anchor="nw")
+            inner.bind("<Configure>",
+                       lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.bind("<Configure>",
+                        lambda e: canvas.itemconfig(canvas_win, width=e.width))
+
+            row_vars = []   # list of (sp_var, dur_var)
+
+            def _render():
+                for w in inner.winfo_children():
+                    w.destroy()
+                row_vars.clear()
+                for i, (sp, dur) in enumerate(steps_ref):
+                    r = tk.Frame(inner, bg=LFR_BG)
+                    r.pack(fill="x", pady=1)
+                    tk.Label(r, text=f"{i+1}.", bg=LFR_BG, fg=FG_DIM,
+                             font=FONT_SM, width=3, anchor="e").pack(side="left")
+                    sv = tk.StringVar(value=f"{sp:.4f}")
+                    dv = tk.StringVar(value=f"{dur:.1f}")
+                    _entry(r, sv, width=12).pack(side="left", padx=(4, 4))
+                    _entry(r, dv, width=10).pack(side="left", padx=(0, 4))
+                    row_vars.append((sv, dv))
+                    idx = i
+                    _btn(r, "✕", lambda i=idx: _del(i), width=2,
+                         bg="#3d1e1e").pack(side="left")
+
+            def _del(i):
+                steps_ref.pop(i)
+                _render()
+
+            def _add():
+                last_sp = steps_ref[-1][0] if steps_ref else 0.0
+                steps_ref.append((last_sp, 10.0))
+                _render()
+                canvas.yview_moveto(1.0)
+
+            def _save():
+                steps_ref.clear()
+                for sv, dv in row_vars:
+                    try:
+                        sp  = float(sv.get())
+                        dur = float(dv.get())
+                        steps_ref.append((sp, dur))
+                    except ValueError:
+                        pass
+                total = sum(d for _, d in steps_ref)
+                status = (f"{len(steps_ref)} steps  ·  "
+                          f"{total:.0f} s total  ({total/60:.1f} min)")
+                info_lbl.configure(text=status, fg=GREEN)
+
+            _render()
+
+            foot = tk.Frame(grp, bg=LFR_BG)
+            foot.pack(fill="x", padx=8, pady=(4, 2))
+            _btn(foot, "+ Add step", _add).pack(side="left", padx=(0, 6))
+            _btn(foot, "✓ Save", _save, bg="#1e3a1e").pack(side="left")
+
+            info_lbl = tk.Label(grp, text="", bg=LFR_BG, fg=FG_DIM,
+                                font=FONT_SM, anchor="w")
+            info_lbl.pack(fill="x", padx=8, pady=(0, 6))
+
+            return grp
+
+        _make_table(pane, "↑ Spin-up sequence",   self._spinup_steps,   C_FLOW).grid(
+            row=0, column=0, sticky="nsew", padx=4, pady=2)
+        _make_table(pane, "↓ Spin-down sequence", self._spindown_steps, C_PRESS).grid(
+            row=0, column=1, sticky="nsew", padx=4, pady=2)
+        pane.rowconfigure(0, weight=1)
+
+        tk.Label(win, text="Click  ✓ Save  in each panel to apply before running.",
+                 bg=BG, fg=FG_DIM, font=FONT_SM, anchor="w").pack(fill="x", padx=12, pady=(2, 8))
+
+    def _routine_running(self) -> bool:
+        return (self._routine_thread is not None
+                and self._routine_thread.is_alive())
+
+    def _start_spinup(self):
+        if not self._alicat.is_connected:
+            messagebox.showwarning("Spin routine", "Connect the Alicat first.")
+            return
+        if not self._spinup_steps:
+            messagebox.showwarning("Spin routine",
+                                   "No spin-up steps defined.\nClick 'Edit routines…' to add steps.")
+            return
+        self._launch_routine(self._spinup_steps, label="Spin UP")
+
+    def _start_spindown(self):
+        if not self._alicat.is_connected:
+            messagebox.showwarning("Spin routine", "Connect the Alicat first.")
+            return
+        if not self._spindown_steps:
+            messagebox.showwarning("Spin routine",
+                                   "No spin-down steps defined.\nClick 'Edit routines…' to add steps.")
+            return
+        self._launch_routine(self._spindown_steps, label="Spin DOWN")
+
+    def _launch_routine(self, steps: list[tuple[float, float]], label: str):
+        if self._routine_running():
+            if not messagebox.askyesno("Spin routine",
+                                       "A routine is already running.\nStop it and start the new one?"):
+                return
+            self._stop_routine()
+            time.sleep(0.15)
+
+        self._routine_stop.clear()
+        self._routine_pause.clear()
+        self._routine_thread = threading.Thread(
+            target=self._run_routine,
+            args=(steps, label),
+            daemon=True,
+        )
+        self._routine_thread.start()
+        self._routine_lbl.configure(fg=GREEN)
+        self._poll_routine_status()
+
+    def _run_routine(self, steps: list[tuple[float, float]], label: str):
+        """Background thread: step through (setpoint, duration) pairs."""
+        n = len(steps)
+        for i, (sp, dur) in enumerate(steps):
+            if self._routine_stop.is_set():
+                break
+            self._routine_status = f"{label}  step {i+1}/{n}  →  SP {sp:.4f}  ({dur:.0f} s)"
+            try:
+                self._alicat.set_setpoint(sp)
+            except Exception as e:
+                self._routine_status = f"Error: {e}"
+                return
+
+            # Wait for duration, but check for stop/pause every 0.25 s
+            elapsed = 0.0
+            while elapsed < dur:
+                if self._routine_stop.is_set():
+                    self._routine_status = f"{label}  stopped at step {i+1}/{n}"
+                    return
+                if self._routine_pause.is_set():
+                    self._routine_status = (
+                        f"{label}  PAUSED  step {i+1}/{n}  SP {sp:.4f}")
+                    while self._routine_pause.is_set():
+                        if self._routine_stop.is_set():
+                            return
+                        time.sleep(0.1)
+                time.sleep(0.25)
+                elapsed += 0.25
+
+        if not self._routine_stop.is_set():
+            self._routine_status = f"{label}  complete  ✓"
+
+    def _pause_routine(self):
+        if not self._routine_running():
+            return
+        if self._routine_pause.is_set():
+            self._routine_pause.clear()          # resume
+            self._pause_btn.configure(text="⏸ Pause")
+        else:
+            self._routine_pause.set()            # pause
+            self._pause_btn.configure(text="▶ Resume")
+
+    def _stop_routine(self):
+        self._routine_stop.set()
+        self._routine_pause.clear()
+        self._pause_btn.configure(text="⏸ Pause")
+        if hasattr(self, "_routine_lbl"):
+            self._routine_lbl.configure(text="Stopped", fg=RED)
+
+    def _poll_routine_status(self):
+        """Keep the routine status label updated from the UI thread."""
+        if not self._routine_running():
+            # Thread just finished
+            final = self._routine_status or "No routine running"
+            col = GREEN if "✓" in final else (RED if "stop" in final.lower() else FG_DIM)
+            self._routine_lbl.configure(text=final, fg=col)
+            self._pause_btn.configure(text="⏸ Pause")
+            return
+        self._routine_lbl.configure(text=self._routine_status)
+        self.after(250, self._poll_routine_status)
+
     def _send_setpoint(self):
         if not self._alicat.is_connected:
             messagebox.showwarning("Alicat", "Not connected.")
