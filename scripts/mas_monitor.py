@@ -291,10 +291,6 @@ def load_alicat_csv(path: str | Path) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Saved CSVs store absolute pressure — convert to gauge (barg)
-    if "pressure" in df.columns:
-        df["pressure"] = df["pressure"] - 1.01325
-
     return df
 
 
@@ -320,7 +316,7 @@ class AlicatLogger:
         self._csv_rows   = 0
         # Thread-safe command queue (setpoint / gas changes)
         self._cmd_lock    = threading.Lock()
-        self._pending_cmd: str | None = None
+        self._pending_cmds: list[str] = []   # queue; sent FIFO before next poll
 
     def connect(self, baud: int = ALICAT_BAUD) -> None:
         if not HAS_SERIAL:
@@ -380,20 +376,39 @@ class AlicatLogger:
     def is_connected(self) -> bool:
         return self._conn is not None and self._conn.is_open
 
+    def _queue(self, *cmds: str) -> None:
+        """Append one or more ASCII commands to the send queue (thread-safe)."""
+        with self._cmd_lock:
+            self._pending_cmds.extend(cmds)
+
     def set_setpoint(self, value: float) -> None:
         """Queue a setpoint change (sent before the next poll cycle)."""
         if not self.is_connected:
             raise RuntimeError("Not connected to Alicat.")
-        with self._cmd_lock:
-            # Alicat protocol: <address><value>\r  e.g. "A0.500\r"
-            self._pending_cmd = f"{self.address}S{value:.4f}\r"
+        self._queue(f"{self.address}S{value:.4f}\r")
+
+    def set_ramp_rate(self, rate: float) -> None:
+        """Queue a ramp-rate change on the Alicat device (slm/s or bar/s).
+        Sends: <address>SR<value>  e.g. 'ASR0.100'
+        Set rate=0 to disable the device's internal ramp."""
+        if not self.is_connected:
+            raise RuntimeError("Not connected to Alicat.")
+        self._queue(f"{self.address}SR{rate:.4f}\r")
+
+    def set_ramp_rate_and_setpoint(self, rate: float, value: float) -> None:
+        """Atomically queue ramp-rate then setpoint as back-to-back commands."""
+        if not self.is_connected:
+            raise RuntimeError("Not connected to Alicat.")
+        self._queue(
+            f"{self.address}SR{rate:.4f}\r",
+            f"{self.address}S{value:.4f}\r",
+        )
 
     def set_gas(self, gas_id: int) -> None:
         """Queue a gas-type change by integer ID (0=Air, 1=Ar, 2=CO₂, …)."""
         if not self.is_connected:
             raise RuntimeError("Not connected to Alicat.")
-        with self._cmd_lock:
-            self._pending_cmd = f"{self.address}$$G{gas_id:d}\r"
+        self._queue(f"{self.address}$$G{gas_id:d}\r")
 
     def get_dataframe(self) -> pd.DataFrame:
         with self._lock:
@@ -404,11 +419,10 @@ class AlicatLogger:
         interval = 1.0 / self.poll_hz
         while not self._stop.is_set():
             try:
-                # Send any queued command (setpoint / gas change) first
+                # Drain queued commands (setpoint / ramp-rate / gas change)
                 with self._cmd_lock:
-                    cmd = self._pending_cmd
-                    self._pending_cmd = None
-                if cmd:
+                    cmds, self._pending_cmds = self._pending_cmds[:], []
+                for cmd in cmds:
                     self._conn.reset_input_buffer()
                     self._conn.rts = True
                     self._conn.write(cmd.encode())
@@ -482,11 +496,7 @@ class AlicatLogger:
             parts[1:]
         ):
             try:
-                fval = float(val)
-                # Alicat reports absolute pressure; convert to gauge (barg)
-                if label == "pressure":
-                    fval -= 1.01325
-                reading[label] = fval
+                reading[label] = float(val)
             except ValueError:
                 reading[label] = val
         # Accept only if we got at least one numeric value (pressure or mass_flow)
@@ -524,6 +534,10 @@ class MASMonitor(tk.Tk):
         self._routine_stop   = threading.Event()
         self._routine_pause  = threading.Event()
         self._routine_status = ""   # written by thread, read by UI tick
+        self._ramp_rate_var  = tk.StringVar(value="0.1")   # slm/s; 0 = instant
+        self._pressure_offset  = 1.01325                   # bar abs → gauge; updated by "Zero P"
+        self._sp_ramp_thread: threading.Thread | None = None
+        self._sp_ramp_stop   = threading.Event()
 
         # ttk style overrides for comboboxes — keep default Aqua theme so that
         # tk.Button respects explicit bg colours; only restyle TCombobox fields.
@@ -612,8 +626,45 @@ class MASMonitor(tk.Tk):
     # -- controls strip ----------------------------------------------------
 
     def _build_controls(self):
-        strip = tk.Frame(self, bg=BG_PANEL, padx=8, pady=6)
-        strip.grid(row=2, column=0, sticky="ew")
+        # Outer container — holds the scrollable canvas + scrollbar
+        outer = tk.Frame(self, bg=BG_PANEL)
+        outer.grid(row=2, column=0, sticky="ew")
+        outer.columnconfigure(0, weight=1)
+
+        # Horizontal scrollbar (only visible when needed)
+        hbar = tk.Scrollbar(outer, orient="horizontal", bg=BG_PANEL,
+                            troughcolor=BG_ENTRY, width=8)
+        hbar.grid(row=1, column=0, sticky="ew")
+
+        scr_canvas = tk.Canvas(outer, bg=BG_PANEL, highlightthickness=0,
+                               height=1, xscrollcommand=hbar.set)
+        scr_canvas.grid(row=0, column=0, sticky="ew")
+        hbar.config(command=scr_canvas.xview)
+
+        # The real strip lives inside the canvas
+        strip = tk.Frame(scr_canvas, bg=BG_PANEL, padx=8, pady=6)
+        strip_id = scr_canvas.create_window((0, 0), window=strip, anchor="nw")
+
+        def _on_strip_configure(event):
+            scr_canvas.configure(scrollregion=scr_canvas.bbox("all"),
+                                 height=strip.winfo_reqheight())
+
+        def _on_canvas_configure(event):
+            # If strip fits, no need to scroll — hide scrollbar
+            if strip.winfo_reqwidth() <= event.width:
+                hbar.grid_remove()
+                scr_canvas.itemconfigure(strip_id, width=event.width)
+            else:
+                hbar.grid()
+                scr_canvas.itemconfigure(strip_id, width=strip.winfo_reqwidth())
+
+        strip.bind("<Configure>", _on_strip_configure)
+        scr_canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mouse-wheel horizontal scroll (Shift+scroll or trackpad)
+        def _on_hscroll(event):
+            scr_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+        scr_canvas.bind("<Shift-MouseWheel>", _on_hscroll)
 
         # ── Display ──
         dg = _group(strip, "Display")
@@ -691,7 +742,7 @@ class MASMonitor(tk.Tk):
             self._port_cb.pack(side="left", padx=(6, 4))
             _btn(r0, "⟳", self._scan_ports, width=2).pack(side="left")
             _label2(r0, "  Baud:").pack(side="left")
-            self._baud_var = tk.StringVar(value="9600")
+            self._baud_var = tk.StringVar(value="19200")
             _combo(r0, self._baud_var, ALICAT_BAUDS, width=7).pack(side="left", padx=(4, 6))
             _label2(r0, "Addr:").pack(side="left")
             self._addr_var = tk.StringVar(value="A")
@@ -778,12 +829,22 @@ class MASMonitor(tk.Tk):
         sp_entry.pack(side="left", padx=(6, 6))
         sp_entry.bind("<Return>", lambda _: self._send_setpoint())
         _btn(rs, "Send", self._send_setpoint).pack(side="left", padx=(0, 8))
+        _label2(rs, "Ramp:").pack(side="left")
+        self._sp_ramp_var = tk.StringVar(value="0")
+        _entry(rs, self._sp_ramp_var, width=5).pack(side="left", padx=(4, 2))
+        _label2(rs, "slm/s").pack(side="left", padx=(0, 8))
         _label2(rs, "Gas:").pack(side="left")
         self._gas_var = tk.StringVar(value="Air")
         ALICAT_GASES = ["Air", "Ar", "CH₄", "CO", "CO₂", "C₂H₆", "H₂", "He", "N₂"]
         self._gas_cb = _combo(rs, self._gas_var, ALICAT_GASES, width=6)
         self._gas_cb.pack(side="left", padx=(4, 0))
         self._gas_cb.bind("<<ComboboxSelected>>", lambda _: self._send_gas())
+
+        rz = tk.Frame(cg, bg=LFR_BG); rz.pack(fill="x", padx=8, pady=(2, 2))
+        _btn(rz, "Zero P", self._zero_pressure, bg="#2a2a1e").pack(side="left", padx=(0, 6))
+        self._zero_lbl = tk.Label(rz, text=f"offset: {self._pressure_offset:.5f} bar",
+                                  bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
+        self._zero_lbl.pack(side="left")
 
         self._ctl_status_lbl = tk.Label(
             cg, text="Not connected", bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
@@ -801,7 +862,10 @@ class MASMonitor(tk.Tk):
         _btn(rb, "⏹ Stop", self._stop_routine, bg="#3d1e1e").pack(side="left")
 
         rb2 = tk.Frame(rg, bg=LFR_BG); rb2.pack(fill="x", padx=8, pady=(0, 2))
-        _btn(rb2, "Edit routines…", self._open_routine_editor).pack(side="left")
+        _btn(rb2, "Edit routines…", self._open_routine_editor).pack(side="left", padx=(0, 12))
+        _label2(rb2, "Ramp:").pack(side="left")
+        _entry(rb2, self._ramp_rate_var, width=5).pack(side="left", padx=(4, 4))
+        _label2(rb2, "slm/s  (0 = instant)").pack(side="left")
 
         self._routine_lbl = tk.Label(
             rg, text="No routine running", bg=LFR_BG, fg=FG_DIM,
@@ -1072,7 +1136,7 @@ class MASMonitor(tk.Tk):
 
         handles = []
         if "pressure" in adf.columns:
-            vals = pd.to_numeric(adf["pressure"], errors="coerce")
+            vals = pd.to_numeric(adf["pressure"], errors="coerce") - self._pressure_offset
             l, = ax.plot(ta, vals, lw=0.85, color=C_PRESS, label="Pressure")
             handles.append(l)
             ax.set_ylabel("Pressure (barg)", color=C_PRESS)
@@ -1112,6 +1176,8 @@ class MASMonitor(tk.Tk):
 
         x = merged["frequency_hz"] * mult
         y = pd.to_numeric(merged[col], errors="coerce")
+        if col == "pressure":
+            y = y - self._pressure_offset
         mask = x.notna() & y.notna()
         if mask.sum() < 2:
             ax.text(0.5, 0.5, "Insufficient overlap", ha="center", va="center",
@@ -1303,7 +1369,10 @@ class MASMonitor(tk.Tk):
 
         def _fmt(key, decimals=3):
             try:
-                return f"{float(r[key]):.{decimals}f}"
+                v = float(r[key])
+                if key == "pressure":
+                    v -= self._pressure_offset
+                return f"{v:.{decimals}f}"
             except (KeyError, ValueError, TypeError):
                 return "–"
 
@@ -1556,33 +1625,91 @@ class MASMonitor(tk.Tk):
         self._poll_routine_status()
 
     def _run_routine(self, steps: list[tuple[float, float]], label: str):
-        """Background thread: step through (setpoint, duration) pairs."""
-        n = len(steps)
-        for i, (sp, dur) in enumerate(steps):
-            if self._routine_stop.is_set():
-                break
-            self._routine_status = f"{label}  step {i+1}/{n}  →  SP {sp:.4f}  ({dur:.0f} s)"
-            try:
-                self._alicat.set_setpoint(sp)
-            except Exception as e:
-                self._routine_status = f"Error: {e}"
-                return
+        """Background thread: step through (setpoint, duration) pairs with optional ramping."""
+        try:
+            ramp = float(self._ramp_rate_var.get())
+        except ValueError:
+            ramp = 0.0
+        ramp = max(0.0, ramp)
 
-            # Wait for duration, but check for stop/pause every 0.25 s
+        TICK = 0.25  # seconds between ramp ticks
+
+        def _wait_or_abort(dur: float, status_fn) -> bool:
+            """Wait *dur* seconds, honouring pause/stop. Returns True if aborted."""
             elapsed = 0.0
             while elapsed < dur:
                 if self._routine_stop.is_set():
-                    self._routine_status = f"{label}  stopped at step {i+1}/{n}"
-                    return
+                    return True
                 if self._routine_pause.is_set():
-                    self._routine_status = (
-                        f"{label}  PAUSED  step {i+1}/{n}  SP {sp:.4f}")
+                    self._routine_status = status_fn() + "  [PAUSED]"
                     while self._routine_pause.is_set():
                         if self._routine_stop.is_set():
-                            return
+                            return True
                         time.sleep(0.1)
-                time.sleep(0.25)
-                elapsed += 0.25
+                time.sleep(TICK)
+                elapsed += TICK
+            return False
+
+        def _ramp_to(sp_from: float, sp_to: float, step_label: str) -> bool:
+            """Ramp from sp_from → sp_to. Returns True if aborted."""
+            if ramp <= 0.0 or abs(sp_to - sp_from) < 1e-6:
+                try:
+                    self._alicat.set_setpoint(sp_to)
+                except Exception as e:
+                    self._routine_status = f"Error: {e}"
+                    return True
+                return False
+            direction = 1.0 if sp_to > sp_from else -1.0
+            current = sp_from
+            while direction * (sp_to - current) > 1e-6:
+                if self._routine_stop.is_set():
+                    return True
+                if self._routine_pause.is_set():
+                    self._routine_status = step_label + f"  ramping…  SP {current:.4f}  [PAUSED]"
+                    while self._routine_pause.is_set():
+                        if self._routine_stop.is_set():
+                            return True
+                        time.sleep(0.1)
+                step_size = ramp * TICK
+                current = current + direction * step_size
+                # Clamp to target
+                if direction * (current - sp_to) > 0:
+                    current = sp_to
+                self._routine_status = step_label + f"  ramping…  SP {current:.4f}"
+                try:
+                    self._alicat.set_setpoint(current)
+                except Exception as e:
+                    self._routine_status = f"Error: {e}"
+                    return True
+                time.sleep(TICK)
+            return False
+
+        n = len(steps)
+        prev_sp = steps[0][0] if steps else 0.0
+        # seed prev_sp from last known reading if available
+        if self._alicat and self._alicat.last_reading:
+            try:
+                prev_sp = float(self._alicat.last_reading.get("setpoint", prev_sp))
+            except (TypeError, ValueError):
+                pass
+
+        for i, (sp, dur) in enumerate(steps):
+            if self._routine_stop.is_set():
+                break
+            step_lbl = f"{label}  step {i+1}/{n}  →  SP {sp:.4f}"
+            self._routine_status = step_lbl + "  (ramping…)"
+
+            # Ramp to target setpoint
+            if _ramp_to(prev_sp, sp, step_lbl):
+                self._routine_status = f"{label}  stopped at step {i+1}/{n}"
+                return
+            prev_sp = sp
+
+            # Hold at setpoint for dur seconds
+            self._routine_status = f"{step_lbl}  ({dur:.0f} s hold)"
+            if _wait_or_abort(dur, lambda s=step_lbl, d=dur: f"{s}  ({d:.0f} s hold)"):
+                self._routine_status = f"{label}  stopped at step {i+1}/{n}"
+                return
 
         if not self._routine_stop.is_set():
             self._routine_status = f"{label}  complete  ✓"
@@ -1616,21 +1743,86 @@ class MASMonitor(tk.Tk):
         self._routine_lbl.configure(text=self._routine_status)
         self.after(250, self._poll_routine_status)
 
+    def _zero_pressure(self):
+        """Capture the current absolute pressure reading as the gauge-zero offset."""
+        raw = None
+        if self._alicat.is_connected and self._alicat.last_reading:
+            raw = self._alicat.last_reading.get("pressure")
+        if raw is None:
+            messagebox.showwarning("Zero P",
+                "No live pressure reading available.\n"
+                "Connect the Alicat and wait for at least one poll.")
+            return
+        self._pressure_offset = float(raw)
+        self._zero_lbl.configure(
+            text=f"offset: {self._pressure_offset:.5f} bar", fg=GREEN)
+        self._redraw()
+
     def _send_setpoint(self):
         if not self._alicat.is_connected:
             messagebox.showwarning("Alicat", "Not connected.")
             return
         try:
-            val = float(self._sp_entry_var.get())
+            target = float(self._sp_entry_var.get())
         except ValueError:
             messagebox.showerror("Setpoint", "Enter a valid number.")
             return
         try:
-            self._alicat.set_setpoint(val)
-            self._ctl_status_lbl.configure(
-                text=f"Setpoint → {val:.4f} sent", fg=ACCENT)
-        except Exception as exc:
-            messagebox.showerror("Setpoint", str(exc))
+            ramp = max(0.0, float(self._sp_ramp_var.get()))
+        except ValueError:
+            ramp = 0.0
+
+        # Cancel any in-progress ramp
+        if self._sp_ramp_thread and self._sp_ramp_thread.is_alive():
+            self._sp_ramp_stop.set()
+            self._sp_ramp_thread.join(timeout=1.0)
+        self._sp_ramp_stop.clear()
+
+        if ramp <= 0.0:
+            try:
+                self._alicat.set_setpoint(target)
+                self._ctl_status_lbl.configure(
+                    text=f"Setpoint → {target:.4f} sent", fg=ACCENT)
+            except Exception as exc:
+                messagebox.showerror("Setpoint", str(exc))
+        else:
+            def _do_ramp():
+                # Start from device's current setpoint if available
+                current = target
+                if self._alicat.last_reading:
+                    try:
+                        current = float(self._alicat.last_reading.get("setpoint", target))
+                    except (TypeError, ValueError):
+                        pass
+                direction = 1.0 if target > current else -1.0
+                if abs(target - current) < 1e-6:
+                    return
+                TICK = 0.25
+                step = ramp * TICK
+                self.after(0, lambda: self._ctl_status_lbl.configure(
+                    text=f"Ramping → {target:.4f}  ({ramp:.4f}/s) …", fg=AMBER))
+                while direction * (target - current) > 1e-6:
+                    if self._sp_ramp_stop.is_set():
+                        self.after(0, lambda: self._ctl_status_lbl.configure(
+                            text="Ramp cancelled", fg=FG_DIM))
+                        return
+                    current = min(target, current + direction * step) if direction > 0 \
+                              else max(target, current + direction * step)
+                    try:
+                        self._alicat.set_setpoint(current)
+                    except Exception as exc:
+                        self.after(0, lambda e=exc: self._ctl_status_lbl.configure(
+                            text=f"Ramp error: {e}", fg="#e05555"))
+                        return
+                    v = current
+                    self.after(0, lambda v=v: self._ctl_status_lbl.configure(
+                        text=f"Ramping… SP {v:.4f}", fg=AMBER))
+                    time.sleep(TICK)
+                self.after(0, lambda: self._ctl_status_lbl.configure(
+                    text=f"Setpoint → {target:.4f} reached", fg=ACCENT))
+
+            self._sp_ramp_thread = threading.Thread(target=_do_ramp, daemon=True)
+            self._sp_ramp_thread.start()
 
     _GAS_IDS = {
         "Air":  0,
@@ -1786,9 +1978,10 @@ class MASMonitor(tk.Tk):
         if ax_g is not None:
             ta = pd.to_datetime(alic["timestamp"])
             if "pressure" in alic.columns:
-                ax_g.plot(ta, pd.to_numeric(alic["pressure"], errors="coerce"),
+                ax_g.plot(ta,
+                          pd.to_numeric(alic["pressure"], errors="coerce") - self._pressure_offset,
                           lw=0.8, color=C_PRESS, label="Pressure")
-                ax_g.set_ylabel("Pressure", color=C_PRESS)
+                ax_g.set_ylabel("Pressure (barg)", color=C_PRESS)
             if "mass_flow" in alic.columns:
                 axr = ax_g.twinx()
                 axr.plot(ta, pd.to_numeric(alic["mass_flow"], errors="coerce"),
@@ -1809,6 +2002,8 @@ class MASMonitor(tk.Tk):
                 if not merged.empty and col in merged.columns:
                     x = merged["frequency_hz"] * mult
                     y = pd.to_numeric(merged[col], errors="coerce")
+                    if col == "pressure":
+                        y = y - self._pressure_offset
                     mask = x.notna() & y.notna()
                     if mask.sum() >= 2:
                         idx = np.arange(mask.sum())
