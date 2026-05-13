@@ -619,6 +619,7 @@ class MASMonitor(tk.Tk):
         pf.columnconfigure(0, weight=1)
 
         self._fig = Figure(facecolor=BG, tight_layout=False)
+        self._fig.set_layout_engine("none")
         self._canvas = FigureCanvasTkAgg(self._fig, master=pf)
         self._canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
@@ -762,6 +763,44 @@ class MASMonitor(tk.Tk):
         wc.pack(side="left", padx=(6, 0))
         wc.bind("<<ComboboxSelected>>", lambda _: self._redraw())
 
+        # ── Frequency limits ──
+        lg = _group(row, "Freq limits")
+        lg.pack(side="left", padx=(0, 10), fill="y", pady=2)
+
+        r = tk.Frame(lg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(6, 2))
+        self._freq_lim_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(r, text="Enable", variable=self._freq_lim_var,
+            bg=LFR_BG, fg=FG, font=FONT, selectcolor=BG_ENTRY,
+            activebackground=LFR_BG, activeforeground=FG,
+            command=self._redraw).pack(side="left", padx=(0, 6))
+
+        r = tk.Frame(lg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=2)
+        _label2(r, "Low:").pack(side="left")
+        self._freq_lo_var = tk.StringVar(value="0")
+        lo_e = _entry(r, self._freq_lo_var, width=9)
+        lo_e.pack(side="left", padx=(4, 2))
+        lo_e.bind("<Return>", lambda _: self._redraw())
+        lo_e.bind("<FocusOut>", lambda _: self._redraw())
+
+        r = tk.Frame(lg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=2)
+        _label2(r, "High:").pack(side="left")
+        self._freq_hi_var = tk.StringVar(value="1e9")
+        hi_e = _entry(r, self._freq_hi_var, width=9)
+        hi_e.pack(side="left", padx=(4, 2))
+        hi_e.bind("<Return>", lambda _: self._redraw())
+        hi_e.bind("<FocusOut>", lambda _: self._redraw())
+
+        r = tk.Frame(lg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(2, 4))
+        _label2(r, "Unit:").pack(side="left")
+        self._freq_lim_unit_var = tk.StringVar(value="Hz")
+        lu = _combo(r, self._freq_lim_unit_var, ["Hz", "kHz", "kRPM"], width=6)
+        lu.pack(side="left", padx=(4, 0))
+        lu.bind("<<ComboboxSelected>>", lambda _: self._redraw())
+
+        r = tk.Frame(lg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(0, 8))
+        self._freq_lim_count_lbl = tk.Label(r, text="", bg=LFR_BG, fg=FG_DIM, font=FONT_SM)
+        self._freq_lim_count_lbl.pack(side="left")
+
         # ════════════════════════════════════════════════
         # TAB 2 — Gas & Pressure Control
         # Layout: [Connection A+B] | [Control A] | [Control B]
@@ -813,33 +852,41 @@ class MASMonitor(tk.Tk):
                 ui["addr_var"] = tk.StringVar(value="A" if i == 0 else "B")
                 _entry(r0, ui["addr_var"], width=3).pack(side="left", padx=(4, 0))
 
-                # Log CSV + logging button
-                r_csv = tk.Frame(cxg, bg=LFR_BG); r_csv.pack(fill="x", padx=8, pady=(0, 2))
-                _label2(r_csv, "Log CSV:").pack(side="left")
-                ui["status_lbl"] = tk.Label(
-                    r_csv, text="  not set  ",
-                    bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
-                    relief="flat", bd=0, padx=4, pady=1, anchor="w", width=18,
-                    highlightbackground=BORDER, highlightthickness=1)
-                ui["status_lbl"].pack(side="left", padx=(4, 4))
-                _btn(r_csv, "Browse…", lambda ii=i: self._browse_alicat_csv(ii)).pack(side="left")
-
                 r1 = tk.Frame(cxg, bg=LFR_BG); r1.pack(fill="x", padx=8, pady=(0, 2))
                 ui["conn_btn"] = _btn(r1, "Connect", lambda ii=i: self._toggle_alicat_conn(ii))
                 ui["conn_btn"].pack(side="left", padx=(0, 6))
-                ui["log_btn"]  = _btn(r1, "▶  Start logging",
-                                       lambda ii=i: self._toggle_alicat_log(ii))
-                ui["log_btn"].configure(state="disabled")
-                ui["log_btn"].pack(side="left", padx=(0, 6))
                 _btn(r1, "Serial monitor…",
                      lambda ii=i: self._open_serial_monitor(ii)).pack(side="left")
 
                 if i == 0:
                     tk.Frame(cxg, bg=BORDER, height=1).pack(fill="x", padx=8, pady=(6, 0))
 
+            # ── Unified log (frequency + both Alicats) ──
+            tk.Frame(cxg, bg=BORDER, height=1).pack(fill="x", padx=8, pady=(6, 0))
+            tk.Label(cxg, text="Unified log  (freq + A + B)", bg=LFR_BG, fg=FG,
+                     font=FONT_B, anchor="w").pack(fill="x", padx=8, pady=(6, 2))
+
+            r_ulog = tk.Frame(cxg, bg=LFR_BG); r_ulog.pack(fill="x", padx=8, pady=(0, 2))
+            _label2(r_ulog, "File:").pack(side="left")
+            self._unified_log_lbl = tk.Label(
+                r_ulog, text="  not set  ",
+                bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
+                relief="flat", bd=0, padx=4, pady=1, anchor="w", width=20,
+                highlightbackground=BORDER, highlightthickness=1)
+            self._unified_log_lbl.pack(side="left", padx=(4, 4))
+            _btn(r_ulog, "Browse…", self._browse_unified_log).pack(side="left")
+
+            r_ulog2 = tk.Frame(cxg, bg=LFR_BG); r_ulog2.pack(fill="x", padx=8, pady=(0, 4))
+            self._unified_log_btn = _btn(r_ulog2, "▶  Start logging", self._toggle_unified_log)
+            self._unified_log_btn.pack(side="left", padx=(0, 6))
+            self._unified_log_row_lbl = tk.Label(r_ulog2, text="", bg=LFR_BG,
+                                                  fg=FG_DIM, font=FONT_SM)
+            self._unified_log_row_lbl.pack(side="left")
+
             # Historical file loader at the bottom of the connection column
+            tk.Frame(cxg, bg=BORDER, height=1).pack(fill="x", padx=8, pady=(2, 0))
             r_hist = tk.Frame(cxg, bg=LFR_BG); r_hist.pack(fill="x", padx=8, pady=(8, 2))
-            _label2(r_hist, "Load file (A):").pack(side="left")
+            _label2(r_hist, "Load file:").pack(side="left")
             self._alicat_file_lbl = tk.Label(
                 r_hist, text="  no file loaded  ",
                 bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
@@ -1120,6 +1167,29 @@ class MASMonitor(tk.Tk):
             if secs:
                 df = df[df["elapsed_s"] >= df["elapsed_s"].iloc[-1] - secs].copy()
 
+        # ── Frequency limits ─────────────────────────────────────────────────
+        if self._freq_lim_var.get():
+            try:
+                lim_unit = self._freq_lim_unit_var.get()
+                lim_mult = UNIT_MULTS.get(lim_unit, 1.0)   # lim values are in lim_unit
+                lo_hz = float(self._freq_lo_var.get()) / lim_mult
+                hi_hz = float(self._freq_hi_var.get()) / lim_mult
+                n_before = len(df)
+                df = df[(df["frequency_hz"] >= lo_hz) & (df["frequency_hz"] <= hi_hz)].copy()
+                n_dropped = n_before - len(df)
+                self._freq_lim_count_lbl.configure(
+                    text=f"{len(df):,} kept  ·  {n_dropped:,} dropped", fg=FG_DIM)
+            except (ValueError, AttributeError):
+                pass
+        else:
+            try:
+                self._freq_lim_count_lbl.configure(text="")
+            except AttributeError:
+                pass
+
+        if df.empty:
+            return df
+
         f = df["frequency_hz"].values.copy()
 
         # ── Despiking ────────────────────────────────────────────────────────
@@ -1289,7 +1359,7 @@ class MASMonitor(tk.Tk):
         parts = []
         if self._csv_path:
             parts.append(self._csv_path.name)
-        if self._alicat_file_path and not (self._alicat.is_connected and self._alicat_logging):
+        if self._alicat_file_path and not self._alicats[0].is_connected:
             parts.append(f"+ {self._alicat_file_path.name}")
         ax.set_title("  ·  ".join(parts), fontsize=8, color=FG_DIM, pad=4)
 
@@ -1423,33 +1493,105 @@ class MASMonitor(tk.Tk):
         if ports and not ui["port_var"].get():
             ui["port_var"].set(ports[0])
 
-    def _browse_alicat_csv(self, idx: int = 0):
+    # ── Unified log ────────────────────────────────────────────────────────
+
+    def _browse_unified_log(self):
         path = filedialog.asksaveasfilename(
-            title=f"Alicat {'A' if idx == 0 else 'B'} log file",
+            title="Unified log file",
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialfile=f"alicat_{'a' if idx == 0 else 'b'}_log.csv",
+            initialfile="mas_log.csv",
         )
         if path:
-            self._alicat_csv_path[idx] = Path(path)
-            ui = self._alicat_ui[idx]
-            if ui.get("status_lbl"):
-                ui["status_lbl"].configure(
-                    text=f"  {self._alicat_csv_path[idx].name}  ", fg=FG)
+            self._unified_csv_path = Path(path)
+            self._unified_log_lbl.configure(
+                text=f"  {self._unified_csv_path.name}  ", fg=FG)
+
+    def _toggle_unified_log(self):
+        if self._unified_logging:
+            self._stop_unified_log()
+        else:
+            if not self._unified_csv_path:
+                messagebox.showwarning("Unified log", "Choose a file path first (Browse…).")
+                return
+            self._start_unified_log(self._unified_csv_path)
+
+    def _start_unified_log(self, path: Path):
+        try:
+            self._unified_log_fh     = open(path, "w", newline="", encoding="utf-8")
+            self._unified_log_writer = csv.writer(self._unified_log_fh)
+            self._unified_log_writer.writerow(UNIFIED_CSV_COLS)
+            self._unified_log_fh.flush()
+            self._unified_log_rows   = 0
+            self._unified_logging    = True
+            self._unified_log_btn.configure(text="⏹  Stop logging")
+            self._unified_log_lbl.configure(
+                text=f"  {path.name}  ", fg=GREEN)
+        except Exception as exc:
+            messagebox.showerror("Unified log", f"Could not open log file:\n{exc}")
+
+    def _stop_unified_log(self):
+        self._unified_logging = False
+        if self._unified_log_fh is not None:
+            try:
+                self._unified_log_fh.flush()
+                self._unified_log_fh.close()
+            except Exception:
+                pass
+            self._unified_log_fh     = None
+            self._unified_log_writer = None
+        self._unified_log_btn.configure(text="▶  Start logging")
+        if self._unified_csv_path:
+            self._unified_log_lbl.configure(
+                text=f"  {self._unified_csv_path.name}  ", fg=FG)
+
+    def _write_unified_row(self):
+        """Write one row to the unified log: timestamp, latest freq, A readings, B readings."""
+        if not self._unified_logging or self._unified_log_writer is None:
+            return
+
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        # Latest frequency — most recent row in loaded PicoScope dataframe
+        freq_hz = ""
+        if not self._df.empty and "frequency_hz" in self._df.columns:
+            last = self._df["frequency_hz"].dropna()
+            if not last.empty:
+                freq_hz = f"{last.iloc[-1]:.4f}"
+
+        def _alicat_cols(idx: int) -> list:
+            al = self._alicats[idx]
+            r  = al.last_reading if al.is_connected else None
+            if not r:
+                return ["", "", "", "", "", ""]
+            return [
+                r.get("pressure",    ""),
+                r.get("temperature", ""),
+                r.get("vol_flow",    ""),
+                r.get("mass_flow",   ""),
+                r.get("setpoint",    ""),
+                r.get("gas",         ""),
+            ]
+
+        row = [ts, freq_hz] + _alicat_cols(0) + _alicat_cols(1)
+        self._unified_log_writer.writerow(row)
+        self._unified_log_fh.flush()
+        self._unified_log_rows += 1
+        self._unified_log_row_lbl.configure(
+            text=f"{self._unified_log_rows} rows", fg=FG_DIM)
+
+    # ── Alicat connection ───────────────────────────────────────────────────
 
     def _toggle_alicat_conn(self, idx: int = 0):
         al = self._alicats[idx]
         ui = self._alicat_ui[idx]
         lname = f"Alicat {'A' if idx == 0 else 'B'}"
         if al.is_connected:
-            self._alicat_logging[idx] = False
             if idx == 0:
                 self._stop_live_redraw()
             al.disconnect()
             if ui.get("conn_btn"):
                 ui["conn_btn"].configure(text="Connect")
-            if ui.get("log_btn"):
-                ui["log_btn"].configure(state="disabled", text="▶  Start logging")
             if ui.get("alicat_lbl"):
                 ui["alicat_lbl"].configure(text=f"{lname}  —  Disconnected.", fg=FG_DIM)
             if ui.get("ctl_status_lbl"):
@@ -1480,8 +1622,6 @@ class MASMonitor(tk.Tk):
                         text=f"offset: {ui['pressure_offset']:.5f} bar", fg=FG_DIM)
                 if ui.get("conn_btn"):
                     ui["conn_btn"].configure(text="Disconnect")
-                if ui.get("log_btn"):
-                    ui["log_btn"].configure(state="normal")
                 if ui.get("alicat_lbl"):
                     ui["alicat_lbl"].configure(text=f"{lname}  —  Connected: {port}", fg=GREEN)
                 if ui.get("ctl_status_lbl"):
@@ -1494,36 +1634,6 @@ class MASMonitor(tk.Tk):
                     self._start_live_redraw()
             except Exception as exc:
                 messagebox.showerror(lname, str(exc))
-
-    def _toggle_alicat_log(self, idx: int = 0):
-        al = self._alicats[idx]
-        if not al.is_connected:
-            return
-        ui = self._alicat_ui[idx]
-        lname = f"Alicat {'A' if idx == 0 else 'B'}"
-        self._alicat_logging[idx] = not self._alicat_logging[idx]
-        if self._alicat_logging[idx]:
-            csv_path = self._alicat_csv_path[idx]
-            if csv_path:
-                try:
-                    al.start_csv_log(csv_path)
-                    csv_note = f"  →  {csv_path.name}"
-                except Exception as exc:
-                    messagebox.showerror(f"{lname} CSV", f"Could not open log file:\n{exc}")
-                    self._alicat_logging[idx] = False
-                    return
-            else:
-                csv_note = "  (no CSV file set)"
-            if ui.get("log_btn"):
-                ui["log_btn"].configure(text="⏹  Stop logging")
-            if ui.get("alicat_lbl"):
-                ui["alicat_lbl"].configure(text=f"{lname}  —  Logging{csv_note}", fg=GREEN)
-        else:
-            al.stop_csv_log()
-            if ui.get("log_btn"):
-                ui["log_btn"].configure(text="▶  Start logging")
-            if ui.get("alicat_lbl"):
-                ui["alicat_lbl"].configure(text=f"{lname}  —  Connected (paused)", fg=ACCENT)
 
     def _poll_alicat_status(self):
         for idx in range(2):
@@ -1542,11 +1652,9 @@ class MASMonitor(tk.Tk):
                                 parts.append(f"{lbl}: {float(r[k]):.2f}")
                             except (ValueError, TypeError):
                                 pass
-                    rows = al.csv_rows_written
-                    csv_info = f"  [{rows} rows→CSV]" if rows > 0 and self._alicat_logging[idx] else ""
                     if parts and ui.get("alicat_lbl"):
                         ui["alicat_lbl"].configure(
-                            text=f"{lname}  —  " + "   ".join(parts) + csv_info, fg=GREEN)
+                            text=f"{lname}  —  " + "   ".join(parts), fg=GREEN)
                     self._update_control_readout(r, idx)
 
                 if al.error:
@@ -1563,6 +1671,7 @@ class MASMonitor(tk.Tk):
                     ui["ctl_status_lbl"].configure(
                         text=f"{n_readings} readings  ·  raw: {raw_preview!r}", fg=AMBER)
 
+        self._write_unified_row()
         self.after(1000, self._poll_alicat_status)
 
     def _update_control_readout(self, r: dict, idx: int = 0):
@@ -1588,11 +1697,9 @@ class MASMonitor(tk.Tk):
         ui["ctl_sp_lbl"].configure(text=_fmt("setpoint", 4))
 
         n_readings = len(al._data)
-        rows = al.csv_rows_written
-        log_info = f"  ·  {rows} rows→CSV" if rows > 0 and self._alicat_logging[idx] else ""
         raw_preview = al.last_raw[:60] if al.last_raw else "waiting…"
         ui["ctl_status_lbl"].configure(
-            text=f"{n_readings} readings  ·  {raw_preview}{log_info}", fg=GREEN)
+            text=f"{n_readings} readings  ·  {raw_preview}", fg=GREEN)
 
     def _open_serial_monitor(self, idx: int = 0):
         """Open a live scrolling window showing raw TX/RX bytes."""
@@ -2177,7 +2284,7 @@ class MASMonitor(tk.Tk):
         title_parts = []
         if self._csv_path:
             title_parts.append(self._csv_path.name)
-        if self._alicat_file_path and not (self._alicat.is_connected and self._alicat_logging):
+        if self._alicat_file_path and not self._alicats[0].is_connected:
             title_parts.append(self._alicat_file_path.name)
         ax_f.set_title(
             "MAS spin frequency  —  " + "  ·  ".join(title_parts) if title_parts
