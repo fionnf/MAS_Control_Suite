@@ -1298,14 +1298,6 @@ class MASMonitor(tk.Tk):
         self._ctl_q_lbl.configure(text=_fmt("mass_flow", 4))
         sp_str = _fmt("setpoint", 4)
         self._ctl_sp_lbl.configure(text=sp_str)
-        # Pre-fill the setpoint entry with the live value (only when field untouched)
-        try:
-            float(self._sp_entry_var.get())
-        except ValueError:
-            pass
-        else:
-            if self._sp_entry_var.get() == "0.0000" and sp_str != "–":
-                self._sp_entry_var.set(sp_str)
 
         n_readings = len(self._alicat._data)
         rows = self._alicat.csv_rows_written
