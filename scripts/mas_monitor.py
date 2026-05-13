@@ -291,6 +291,10 @@ def load_alicat_csv(path: str | Path) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Saved CSVs store absolute pressure — convert to gauge (barg)
+    if "pressure" in df.columns:
+        df["pressure"] = df["pressure"] - 1.01325
+
     return df
 
 
@@ -382,7 +386,7 @@ class AlicatLogger:
             raise RuntimeError("Not connected to Alicat.")
         with self._cmd_lock:
             # Alicat protocol: <address><value>\r  e.g. "A0.500\r"
-            self._pending_cmd = f"{self.address}{value:.4f}\r"
+            self._pending_cmd = f"{self.address}S{value:.4f}\r"
 
     def set_gas(self, gas_id: int) -> None:
         """Queue a gas-type change by integer ID (0=Air, 1=Ar, 2=CO₂, …)."""
@@ -405,8 +409,14 @@ class AlicatLogger:
                     cmd = self._pending_cmd
                     self._pending_cmd = None
                 if cmd:
+                    self._conn.reset_input_buffer()
+                    self._conn.rts = True
                     self._conn.write(cmd.encode())
-                    self._conn.readline()   # discard echo / ack
+                    self._conn.flush()
+                    time.sleep(0.01)
+                    self._conn.rts = False
+                    time.sleep(0.05)
+                    self._conn.read_until(b"\r")   # discard echo / ack
 
                 r = self._poll()
                 if r:
@@ -472,7 +482,11 @@ class AlicatLogger:
             parts[1:]
         ):
             try:
-                reading[label] = float(val)
+                fval = float(val)
+                # Alicat reports absolute pressure; convert to gauge (barg)
+                if label == "pressure":
+                    fval -= 1.01325
+                reading[label] = fval
             except ValueError:
                 reading[label] = val
         # Accept only if we got at least one numeric value (pressure or mass_flow)
@@ -751,7 +765,7 @@ class MASMonitor(tk.Tk):
 
         # Units labels (small, below tiles)
         ru = tk.Frame(cg, bg=LFR_BG); ru.pack(fill="x", padx=8, pady=(0, 2))
-        for col, txt in enumerate(["bar", "°C", "slm", "slm"]):
+        for col, txt in enumerate(["barg", "°C", "slm", "slm"]):
             tk.Label(ru, text=txt, bg=LFR_BG, fg=FG_DIM, font=("Helvetica Neue", 9),
                      anchor="center").grid(row=0, column=col, sticky="ew", padx=(0, 4) if col < 3 else 0)
             ru.columnconfigure(col, weight=1)
@@ -1061,7 +1075,7 @@ class MASMonitor(tk.Tk):
             vals = pd.to_numeric(adf["pressure"], errors="coerce")
             l, = ax.plot(ta, vals, lw=0.85, color=C_PRESS, label="Pressure")
             handles.append(l)
-            ax.set_ylabel("Pressure", color=C_PRESS)
+            ax.set_ylabel("Pressure (barg)", color=C_PRESS)
             ax.tick_params(axis="y", labelcolor=C_PRESS)
 
         if "mass_flow" in adf.columns:
