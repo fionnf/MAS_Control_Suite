@@ -89,6 +89,12 @@ FONT_SM   = ("Helvetica Neue", 10)
 FONT_B    = ("Helvetica Neue", 11, "bold")
 
 # ── Constants ──────────────────────────────────────────────────────────────
+# Local atmospheric pressure for Zurich (~408 m altitude).
+# Used as the default gauge-zero reference so the display reads in barg.
+# "Zero P" sets offset → 0.0 (raw absolute) so SP=0 truly closes the valve.
+# "Clear offset" resets to this value.
+LOCAL_ATMOS    = 0.953   # bar absolute, Zurich
+
 APP_TITLE      = "MAS Rotor Monitor"
 UNIT_MULTS     = {"Hz": 1.0, "kHz": 1e-3, "kRPM": 60e-3}
 FILTER_TYPES   = ["None", "Mean", "Median", "Savitzky-Golay", "Gaussian"]
@@ -518,26 +524,34 @@ class MASMonitor(tk.Tk):
 
         self._csv_path: Path | None = None
         self._df       = pd.DataFrame()
-        self._alicat   = AlicatLogger("")
-        self._alicat_logging  = False
-        self._alicat_csv_path: Path | None = None
+
+        # Two Alicat instances; index 0 = Alicat A, index 1 = Alicat B
+        self._alicats: list[AlicatLogger] = [AlicatLogger(""), AlicatLogger("")]
+        self._alicat = self._alicats[0]   # backward-compat alias
+
+        # Per-Alicat logging state
+        self._alicat_logging: list[bool] = [False, False]
+        self._alicat_csv_path: list = [None, None]
+
+        # Shared file-load (Alicat A for legacy scatter/export)
         self._alicat_file_df:  pd.DataFrame = pd.DataFrame()
         self._alicat_file_path: Path | None = None
+
+        # Per-Alicat UI widget dicts (populated by _build_alicat_unit)
+        self._alicat_ui: list[dict] = [{}, {}]
+
         self._refresh_job: str | None = None
         self._live_redraw_job: str | None = None
 
         # Spin routine state
-        # Each step: (setpoint_value, duration_seconds)
-        self._spinup_steps:   list[tuple[float, float]] = []
-        self._spindown_steps: list[tuple[float, float]] = []
+        # Each step: (sp_A, sp_B, duration_seconds)
+        self._spinup_steps:   list[tuple] = []
+        self._spindown_steps: list[tuple] = []
         self._routine_thread: threading.Thread | None = None
         self._routine_stop   = threading.Event()
         self._routine_pause  = threading.Event()
         self._routine_status = ""   # written by thread, read by UI tick
-        self._ramp_rate_var  = tk.StringVar(value="0.1")   # slm/s; 0 = instant
-        self._pressure_offset  = 1.01325                   # bar abs → gauge; updated by "Zero P"
-        self._sp_ramp_thread: threading.Thread | None = None
-        self._sp_ramp_stop   = threading.Event()
+        self._ramp_rate_var  = tk.StringVar(value="0.1")   # barg/s; 0 = instant
 
         # ttk style overrides for comboboxes — keep default Aqua theme so that
         # tk.Button respects explicit bg colours; only restyle TCombobox fields.
@@ -562,56 +576,17 @@ class MASMonitor(tk.Tk):
     # ── UI construction ────────────────────────────────────────────────────
 
     def _build_ui(self):
-        self._build_top_bar()   # row 0
-        self._build_plot()      # row 1 — expands
-        self._build_controls()  # row 2
-        self._build_status()    # row 3
-        self.rowconfigure(1, weight=1)
+        self._build_plot()      # row 0 — expands
+        self._build_controls()  # row 1
+        self._build_status()    # row 2
+        self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
-
-    # -- top bar -----------------------------------------------------------
-
-    def _build_top_bar(self):
-        bar = tk.Frame(self, bg=BG_PANEL, pady=6, padx=10)
-        bar.grid(row=0, column=0, sticky="ew")
-
-        _label(bar, "CSV file:").pack(side="left")
-
-        self._file_lbl = tk.Label(
-            bar, text="  no file loaded  ",
-            bg=BG_ENTRY, fg=FG_DIM, font=FONT,
-            relief="flat", bd=0, padx=6, pady=2,
-            anchor="w", width=38,
-            highlightbackground=BORDER, highlightthickness=1,
-        )
-        self._file_lbl.pack(side="left", padx=(5, 10))
-
-        _btn(bar, "Open…", self._open_csv).pack(side="left")
-
-        _sep_v(bar, 12)
-
-        _label(bar, "Auto-refresh:").pack(side="left")
-        self._refresh_var = tk.StringVar(value="2")
-        _combo(bar, self._refresh_var, REFRESH_SEC, width=4).pack(side="left", padx=(5, 3))
-        _label(bar, "s").pack(side="left", padx=(0, 8))
-
-        self._auto_var = tk.BooleanVar(value=False)
-        self._auto_chk = tk.Checkbutton(
-            bar, text="Auto", variable=self._auto_var,
-            bg=BG_PANEL, fg=FG, font=FONT,
-            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
-            activeforeground=FG,
-            command=self._toggle_auto,
-        )
-        self._auto_chk.pack(side="left", padx=(0, 8))
-
-        _btn(bar, "Refresh", self._reload).pack(side="left")
 
     # -- plot --------------------------------------------------------------
 
     def _build_plot(self):
         pf = tk.Frame(self, bg=BG, padx=4, pady=3)
-        pf.grid(row=1, column=0, sticky="nsew")
+        pf.grid(row=0, column=0, sticky="nsew")
         pf.rowconfigure(0, weight=1)
         pf.columnconfigure(0, weight=1)
 
@@ -627,7 +602,7 @@ class MASMonitor(tk.Tk):
 
     def _build_controls(self):
         outer = tk.Frame(self, bg=BG_PANEL)
-        outer.grid(row=2, column=0, sticky="ew")
+        outer.grid(row=1, column=0, sticky="ew")
         outer.columnconfigure(0, weight=1)
 
         # ── Tab bar ──
@@ -661,9 +636,10 @@ class MASMonitor(tk.Tk):
             self._tab_btns[label]   = btn
             return frame
 
-        freq_tab = _make_tab("Frequency")
-        gas_tab  = _make_tab("Gas & Control")
-        exp_tab  = _make_tab("Export")
+        freq_tab     = _make_tab("Frequency")
+        gas_tab      = _make_tab("Gas & Control")
+        exp_tab      = _make_tab("Export")
+        routine_tab  = _make_tab("Routines")
 
         # ════════════════════════════════════════════════
         # TAB 1 — Frequency display settings
@@ -673,6 +649,37 @@ class MASMonitor(tk.Tk):
 
         row = tk.Frame(strip, bg=BG_PANEL); row.pack(fill="x")
 
+        # ── CSV file ──
+        fg_ = _group(row, "Spin frequency CSV")
+        fg_.pack(side="left", padx=(0, 10), fill="y", pady=2)
+
+        rf = tk.Frame(fg_, bg=LFR_BG); rf.pack(fill="x", padx=8, pady=(6, 2))
+        self._file_lbl = tk.Label(
+            rf, text="  no file loaded  ",
+            bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
+            relief="flat", bd=0, padx=4, pady=1,
+            anchor="w", width=30,
+            highlightbackground=BORDER, highlightthickness=1,
+        )
+        self._file_lbl.pack(side="left", padx=(0, 6))
+        _btn(rf, "Open…", self._open_csv).pack(side="left", padx=(0, 4))
+        _btn(rf, "✕", lambda: self._clear_csv(), width=2).pack(side="left")
+
+        ra = tk.Frame(fg_, bg=LFR_BG); ra.pack(fill="x", padx=8, pady=(2, 8))
+        _label2(ra, "Auto-refresh:").pack(side="left")
+        self._refresh_var = tk.StringVar(value="2")
+        _combo(ra, self._refresh_var, REFRESH_SEC, width=4).pack(side="left", padx=(5, 3))
+        _label2(ra, "s").pack(side="left", padx=(0, 8))
+        self._auto_var = tk.BooleanVar(value=False)
+        self._auto_chk = tk.Checkbutton(
+            ra, text="Auto", variable=self._auto_var,
+            bg=LFR_BG, fg=FG, font=FONT,
+            selectcolor=BG_ENTRY, activebackground=LFR_BG, activeforeground=FG,
+            command=self._toggle_auto)
+        self._auto_chk.pack(side="left", padx=(0, 8))
+        _btn(ra, "Refresh", self._reload).pack(side="left")
+
+        # ── Display ──
         dg = _group(row, "Display")
         dg.pack(side="left", padx=(0, 10), fill="y", pady=2)
 
@@ -729,126 +736,120 @@ class MASMonitor(tk.Tk):
 
         # ════════════════════════════════════════════════
         # TAB 2 — Gas & Pressure Control
+        # Layout: [Connection A+B] | [Control A] | [Control B]
         # ════════════════════════════════════════════════
         row2 = tk.Frame(gas_tab, bg=BG_PANEL); row2.pack(fill="x")
 
-        # ── Alicat connection ──
-        ag = _group(row2, "Alicat flow / pressure meter")
-        ag.pack(side="left", padx=(0, 10), fill="y", pady=2)
+        # Initialise per-unit dicts up front
+        for i in range(2):
+            if not self._alicat_ui[i]:
+                self._alicat_ui[i] = {}
+            d = self._alicat_ui[i]
+            d.setdefault("pressure_offset", LOCAL_ATMOS)
+            d.setdefault("sp_ramp_thread",  None)
+            d.setdefault("sp_ramp_stop",    threading.Event())
+            d.setdefault("valve_after_id",  None)
+            d.setdefault("valve_press_time", None)
+
+        # ── Shared Connection column ──
+        cxg = _group(row2, "Connection")
+        cxg.pack(side="left", padx=(0, 8), fill="y", pady=2)
 
         if not HAS_SERIAL:
-            tk.Label(ag, text="pip install pyserial to enable",
+            tk.Label(cxg, text="pip install pyserial to enable",
                      bg=LFR_BG, fg=FG_DIM, font=FONT_SM).pack(padx=10, pady=10)
         else:
-            r0 = tk.Frame(ag, bg=LFR_BG); r0.pack(fill="x", padx=8, pady=(6, 2))
-            _label2(r0, "Port:").pack(side="left")
-            self._port_var = tk.StringVar()
-            self._port_cb  = _combo(r0, self._port_var, [], width=16)
-            self._port_cb.pack(side="left", padx=(6, 4))
-            _btn(r0, "⟳", self._scan_ports, width=2).pack(side="left")
-            _label2(r0, "  Baud:").pack(side="left")
-            self._baud_var = tk.StringVar(value="19200")
-            _combo(r0, self._baud_var, ALICAT_BAUDS, width=7).pack(side="left", padx=(4, 6))
-            _label2(r0, "Addr:").pack(side="left")
-            self._addr_var = tk.StringVar(value="A")
-            _entry(r0, self._addr_var, width=3).pack(side="left", padx=(4, 0))
+            for i in range(2):
+                lbl_name = f"Alicat {'A' if i == 0 else 'B'}"
+                ui = self._alicat_ui[i]
+                fg_c = C_FLOW if i == 0 else C_PRESS
 
-            r_load = tk.Frame(ag, bg=LFR_BG); r_load.pack(fill="x", padx=8, pady=(0, 2))
-            _label2(r_load, "Load file:").pack(side="left")
+                hr = tk.Frame(cxg, bg=LFR_BG)
+                hr.pack(fill="x", padx=8, pady=(6 if i == 0 else 6, 2))
+                tk.Label(hr, text=lbl_name, bg=LFR_BG, fg=fg_c,
+                         font=FONT_B, anchor="w").pack(side="left", padx=(0, 8))
+                ui["alicat_lbl"] = tk.Label(hr, text="Not connected",
+                    bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
+                ui["alicat_lbl"].pack(side="left")
+
+                r0 = tk.Frame(cxg, bg=LFR_BG); r0.pack(fill="x", padx=8, pady=(0, 2))
+                _label2(r0, "Port:").pack(side="left")
+                ui["port_var"] = tk.StringVar()
+                ui["port_cb"]  = _combo(r0, ui["port_var"], [], width=14)
+                ui["port_cb"].pack(side="left", padx=(6, 4))
+                _btn(r0, "⟳", lambda ii=i: self._scan_ports(ii), width=2).pack(side="left")
+                _label2(r0, "  Baud:").pack(side="left")
+                ui["baud_var"] = tk.StringVar(value="19200")
+                _combo(r0, ui["baud_var"], ALICAT_BAUDS, width=7).pack(side="left", padx=(4, 6))
+                _label2(r0, "Addr:").pack(side="left")
+                ui["addr_var"] = tk.StringVar(value="A" if i == 0 else "B")
+                _entry(r0, ui["addr_var"], width=3).pack(side="left", padx=(4, 0))
+
+                # Log CSV + logging button
+                r_csv = tk.Frame(cxg, bg=LFR_BG); r_csv.pack(fill="x", padx=8, pady=(0, 2))
+                _label2(r_csv, "Log CSV:").pack(side="left")
+                ui["status_lbl"] = tk.Label(
+                    r_csv, text="  not set  ",
+                    bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
+                    relief="flat", bd=0, padx=4, pady=1, anchor="w", width=18,
+                    highlightbackground=BORDER, highlightthickness=1)
+                ui["status_lbl"].pack(side="left", padx=(4, 4))
+                _btn(r_csv, "Browse…", lambda ii=i: self._browse_alicat_csv(ii)).pack(side="left")
+
+                r1 = tk.Frame(cxg, bg=LFR_BG); r1.pack(fill="x", padx=8, pady=(0, 2))
+                ui["conn_btn"] = _btn(r1, "Connect", lambda ii=i: self._toggle_alicat_conn(ii))
+                ui["conn_btn"].pack(side="left", padx=(0, 6))
+                ui["log_btn"]  = _btn(r1, "▶  Start logging",
+                                       lambda ii=i: self._toggle_alicat_log(ii))
+                ui["log_btn"].configure(state="disabled")
+                ui["log_btn"].pack(side="left", padx=(0, 6))
+                _btn(r1, "Serial monitor…",
+                     lambda ii=i: self._open_serial_monitor(ii)).pack(side="left")
+
+                if i == 0:
+                    tk.Frame(cxg, bg=BORDER, height=1).pack(fill="x", padx=8, pady=(6, 0))
+
+            # Historical file loader at the bottom of the connection column
+            r_hist = tk.Frame(cxg, bg=LFR_BG); r_hist.pack(fill="x", padx=8, pady=(8, 2))
+            _label2(r_hist, "Load file (A):").pack(side="left")
             self._alicat_file_lbl = tk.Label(
-                r_load, text="  no file loaded  ",
+                r_hist, text="  no file loaded  ",
                 bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
-                relief="flat", bd=0, padx=4, pady=1, anchor="w", width=24,
+                relief="flat", bd=0, padx=4, pady=1, anchor="w", width=18,
                 highlightbackground=BORDER, highlightthickness=1)
             self._alicat_file_lbl.pack(side="left", padx=(4, 4))
-            _btn(r_load, "Open…", self._open_alicat_file).pack(side="left", padx=(0, 4))
-            _btn(r_load, "✕", self._clear_alicat_file, width=2).pack(side="left")
+            _btn(r_hist, "Open…", self._open_alicat_file).pack(side="left", padx=(0, 4))
+            _btn(r_hist, "✕", self._clear_alicat_file, width=2).pack(side="left")
+            tk.Frame(cxg, bg=LFR_BG, height=4).pack()
 
-            r_csv = tk.Frame(ag, bg=LFR_BG); r_csv.pack(fill="x", padx=8, pady=(0, 2))
-            _label2(r_csv, "Log CSV:").pack(side="left")
-            self._alicat_csv_lbl = tk.Label(
-                r_csv, text="  not set  ",
-                bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
-                relief="flat", bd=0, padx=4, pady=1, anchor="w", width=24,
-                highlightbackground=BORDER, highlightthickness=1)
-            self._alicat_csv_lbl.pack(side="left", padx=(4, 4))
-            _btn(r_csv, "Browse…", self._browse_alicat_csv).pack(side="left")
+        # ── Per-unit Control columns ──
+        self._build_alicat_unit(row2, 0)
+        self._build_alicat_unit(row2, 1)
+        if self._alicat_ui[1].get("panel_frame"):
+            self._alicat_ui[1]["panel_frame"].pack_forget()
 
-            r1 = tk.Frame(ag, bg=LFR_BG); r1.pack(fill="x", padx=8, pady=(2, 2))
-            self._conn_btn = _btn(r1, "Connect", self._toggle_alicat_conn)
-            self._conn_btn.pack(side="left", padx=(0, 8))
-            self._log_btn = _btn(r1, "▶  Start logging", self._toggle_alicat_log)
-            self._log_btn.configure(state="disabled")
-            self._log_btn.pack(side="left", padx=(0, 8))
-            _btn(r1, "Serial monitor…", self._open_serial_monitor).pack(side="left")
+        # ════════════════════════════════════════════════
+        # TAB 3 — Export
+        # ════════════════════════════════════════════════
+        eg = _group(exp_tab, "Export")
+        eg.pack(side="left", fill="y", pady=2, padx=(0, 10))
 
-            self._alicat_lbl = tk.Label(
-                ag, text="Not connected", bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
-            self._alicat_lbl.pack(fill="x", padx=8, pady=(2, 8))
-            self._scan_ports()
+        r = tk.Frame(eg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(6, 2))
+        _label2(r, "From:").pack(side="left")
+        self._t_from = _entry(r, width=18); self._t_from.pack(side="left", padx=(6, 10))
+        _label2(r, "To:").pack(side="left")
+        self._t_to   = _entry(r, width=18); self._t_to.pack(side="left", padx=(6, 10))
+        _btn(r, "Use visible", self._use_visible_range).pack(side="left")
 
-        # ── Pressure Control ──
-        cg = _group(row2, "Pressure control")
-        cg.pack(side="left", padx=(0, 10), fill="y", pady=2)
+        r = tk.Frame(eg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(2, 8))
+        _btn(r, "Save plot (PDF)", lambda: self._export_plot("pdf")).pack(side="left", padx=(0, 6))
+        _btn(r, "Save plot (PNG)", lambda: self._export_plot("png")).pack(side="left", padx=(0, 6))
+        _btn(r, "Save data (CSV)", self._export_csv).pack(side="left")
 
-        ro = tk.Frame(cg, bg=LFR_BG); ro.pack(fill="x", padx=8, pady=(6, 2))
-
-        def _tile(parent, title, col):
-            f = tk.Frame(parent, bg=BG_ENTRY, bd=0,
-                         highlightbackground=BORDER, highlightthickness=1)
-            f.grid_columnconfigure(0, weight=1)
-            tk.Label(f, text=title, bg=BG_ENTRY, fg=FG_DIM,
-                     font=FONT_SM, anchor="w").pack(fill="x", padx=5, pady=(3, 0))
-            val_lbl = tk.Label(f, text="–", bg=BG_ENTRY, fg=col,
-                               font=("Helvetica Neue", 13, "bold"), anchor="w")
-            val_lbl.pack(fill="x", padx=5, pady=(0, 4))
-            return f, val_lbl
-
-        f_p,  self._ctl_p_lbl  = _tile(ro, "Pressure",  C_PRESS)
-        f_t,  self._ctl_t_lbl  = _tile(ro, "Temp",      C_TEMP)
-        f_q,  self._ctl_q_lbl  = _tile(ro, "Mass flow", C_FLOW)
-        f_sp, self._ctl_sp_lbl = _tile(ro, "Setpoint",  FG)
-        for col, tile in enumerate([f_p, f_t, f_q, f_sp]):
-            tile.grid(row=0, column=col, padx=(0, 4) if col < 3 else 0, pady=0, sticky="ew")
-            ro.columnconfigure(col, weight=1)
-
-        ru = tk.Frame(cg, bg=LFR_BG); ru.pack(fill="x", padx=8, pady=(0, 2))
-        for col, txt in enumerate(["barg", "°C", "slm", "barg"]):
-            tk.Label(ru, text=txt, bg=LFR_BG, fg=FG_DIM, font=("Helvetica Neue", 9),
-                     anchor="center").grid(row=0, column=col, sticky="ew",
-                                           padx=(0, 4) if col < 3 else 0)
-            ru.columnconfigure(col, weight=1)
-
-        rs = tk.Frame(cg, bg=LFR_BG); rs.pack(fill="x", padx=8, pady=(4, 2))
-        _label2(rs, "Set SP:").pack(side="left")
-        self._sp_entry_var = tk.StringVar(value="0.0000")
-        sp_entry = _entry(rs, self._sp_entry_var, width=9)
-        sp_entry.pack(side="left", padx=(6, 6))
-        sp_entry.bind("<Return>", lambda _: self._send_setpoint())
-        _btn(rs, "Send", self._send_setpoint).pack(side="left", padx=(0, 8))
-        _label2(rs, "Ramp:").pack(side="left")
-        self._sp_ramp_var = tk.StringVar(value="0")
-        _entry(rs, self._sp_ramp_var, width=5).pack(side="left", padx=(4, 2))
-        _label2(rs, "barg/s").pack(side="left", padx=(0, 8))
-        _label2(rs, "Gas:").pack(side="left")
-        self._gas_var = tk.StringVar(value="Air")
-        ALICAT_GASES = ["Air", "Ar", "CH₄", "CO", "CO₂", "C₂H₆", "H₂", "He", "N₂"]
-        self._gas_cb = _combo(rs, self._gas_var, ALICAT_GASES, width=6)
-        self._gas_cb.pack(side="left", padx=(4, 0))
-        self._gas_cb.bind("<<ComboboxSelected>>", lambda _: self._send_gas())
-
-        rz = tk.Frame(cg, bg=LFR_BG); rz.pack(fill="x", padx=8, pady=(2, 2))
-        _btn(rz, "Zero P", self._zero_pressure, bg="#2a2a1e").pack(side="left", padx=(0, 6))
-        self._zero_lbl = tk.Label(rz, text=f"offset: {self._pressure_offset:.5f} bar",
-                                  bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
-        self._zero_lbl.pack(side="left")
-
-        self._ctl_status_lbl = tk.Label(
-            cg, text="Not connected", bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
-        self._ctl_status_lbl.pack(fill="x", padx=8, pady=(2, 8))
-
-        # ── Spin routine ──
-        rg = _group(row2, "Spin routine")
+        # ════════════════════════════════════════════════
+        # TAB 4 — Routines
+        # ════════════════════════════════════════════════
+        rg = _group(routine_tab, "Spin routine")
         rg.pack(side="left", padx=(0, 10), fill="y", pady=2)
 
         rb = tk.Frame(rg, bg=LFR_BG); rb.pack(fill="x", padx=8, pady=(6, 4))
@@ -869,24 +870,6 @@ class MASMonitor(tk.Tk):
             font=FONT_SM, anchor="w")
         self._routine_lbl.pack(fill="x", padx=8, pady=(2, 8))
 
-        # ════════════════════════════════════════════════
-        # TAB 3 — Export
-        # ════════════════════════════════════════════════
-        eg = _group(exp_tab, "Export")
-        eg.pack(side="left", fill="y", pady=2, padx=(0, 10))
-
-        r = tk.Frame(eg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(6, 2))
-        _label2(r, "From:").pack(side="left")
-        self._t_from = _entry(r, width=18); self._t_from.pack(side="left", padx=(6, 10))
-        _label2(r, "To:").pack(side="left")
-        self._t_to   = _entry(r, width=18); self._t_to.pack(side="left", padx=(6, 10))
-        _btn(r, "Use visible", self._use_visible_range).pack(side="left")
-
-        r = tk.Frame(eg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(2, 8))
-        _btn(r, "Save plot (PDF)", lambda: self._export_plot("pdf")).pack(side="left", padx=(0, 6))
-        _btn(r, "Save plot (PNG)", lambda: self._export_plot("png")).pack(side="left", padx=(0, 6))
-        _btn(r, "Save data (CSV)", self._export_csv).pack(side="left")
-
         # Show Frequency tab by default
         _show_tab("Frequency")
 
@@ -898,9 +881,159 @@ class MASMonitor(tk.Tk):
                        bg=BG_PANEL, fg=FG_DIM, font=FONT_SM,
                        anchor="w", padx=10, pady=4,
                        relief="flat")
-        bar.grid(row=3, column=0, sticky="ew")
+        bar.grid(row=2, column=0, sticky="ew")
+
+    # ── Alicat unit builder ────────────────────────────────────────────────
+
+    def _build_alicat_unit(self, parent, idx: int):
+        """Build the pressure-control panel for Alicat index idx.
+        Connection/logging widgets are built in the shared panels above."""
+        label_name = f"Alicat {'A' if idx == 0 else 'B'}"
+        ui = self._alicat_ui[idx]   # already initialised by _build_controls
+
+        ui["panel_frame"] = tk.Frame(parent, bg=BG_PANEL)
+        ui["panel_frame"].pack(side="left", padx=(0, 10), fill="y", pady=2)
+        panel = ui["panel_frame"]
+
+        # ── Pressure Control group ──
+        cg = _group(panel, f"{label_name} pressure control")
+        cg.pack(fill="x")
+
+        ro = tk.Frame(cg, bg=LFR_BG); ro.pack(fill="x", padx=8, pady=(6, 2))
+
+        def _tile(par, title, col):
+            f = tk.Frame(par, bg=BG_ENTRY, bd=0,
+                         highlightbackground=BORDER, highlightthickness=1)
+            f.grid_columnconfigure(0, weight=1)
+            tk.Label(f, text=title, bg=BG_ENTRY, fg=FG_DIM,
+                     font=FONT_SM, anchor="w").pack(fill="x", padx=5, pady=(3, 0))
+            val_lbl = tk.Label(f, text="–", bg=BG_ENTRY, fg=col,
+                               font=("Helvetica Neue", 13, "bold"), anchor="w")
+            val_lbl.pack(fill="x", padx=5, pady=(0, 4))
+            return f, val_lbl
+
+        f_p,  ui["ctl_p_lbl"]  = _tile(ro, "Pressure",  C_PRESS)
+        f_t,  ui["ctl_t_lbl"]  = _tile(ro, "Temp",      C_TEMP)
+        f_q,  ui["ctl_q_lbl"]  = _tile(ro, "Mass flow", C_FLOW)
+        f_sp, ui["ctl_sp_lbl"] = _tile(ro, "Setpoint",  FG)
+        for col_i, tile in enumerate([f_p, f_t, f_q, f_sp]):
+            tile.grid(row=0, column=col_i, padx=(0, 4) if col_i < 3 else 0, pady=0, sticky="ew")
+            ro.columnconfigure(col_i, weight=1)
+
+        ru = tk.Frame(cg, bg=LFR_BG); ru.pack(fill="x", padx=8, pady=(0, 2))
+        for col_i, txt in enumerate(["barg", "°C", "slm", "barg"]):
+            tk.Label(ru, text=txt, bg=LFR_BG, fg=FG_DIM, font=("Helvetica Neue", 9),
+                     anchor="center").grid(row=0, column=col_i, sticky="ew",
+                                           padx=(0, 4) if col_i < 3 else 0)
+            ru.columnconfigure(col_i, weight=1)
+
+        rs = tk.Frame(cg, bg=LFR_BG); rs.pack(fill="x", padx=8, pady=(4, 2))
+        _label2(rs, "Set SP:").pack(side="left")
+        ui["sp_entry_var"] = tk.StringVar(value="0.0000")
+        sp_entry = _entry(rs, ui["sp_entry_var"], width=9)
+        sp_entry.pack(side="left", padx=(6, 6))
+        sp_entry.bind("<Return>", lambda _, i=idx: self._send_setpoint(i))
+        _btn(rs, "Send", lambda i=idx: self._send_setpoint(i)).pack(side="left", padx=(0, 8))
+        _label2(rs, "Ramp:").pack(side="left")
+        ui["sp_ramp_var"] = tk.StringVar(value="0")
+        _entry(rs, ui["sp_ramp_var"], width=5).pack(side="left", padx=(4, 2))
+        _label2(rs, "barg/s").pack(side="left", padx=(0, 8))
+        _label2(rs, "Gas:").pack(side="left")
+        ui["gas_var"] = tk.StringVar(value="Air")
+        ALICAT_GASES = ["Air", "Ar", "CH₄", "CO", "CO₂", "C₂H₆", "H₂", "He", "N₂"]
+        ui["gas_cb"] = _combo(rs, ui["gas_var"], ALICAT_GASES, width=6)
+        ui["gas_cb"].pack(side="left", padx=(4, 0))
+        ui["gas_cb"].bind("<<ComboboxSelected>>", lambda _, i=idx: self._send_gas(i))
+
+        rz = tk.Frame(cg, bg=LFR_BG); rz.pack(fill="x", padx=8, pady=(2, 2))
+        _btn(rz, "Zero P", lambda i=idx: self._zero_pressure(i), bg="#2a2a1e").pack(side="left", padx=(0, 4))
+        _btn(rz, "Clear offset", lambda i=idx: self._clear_pressure_offset(i)).pack(side="left", padx=(0, 8))
+        ui["pressure_offset"] = LOCAL_ATMOS
+        ui["zero_lbl"] = tk.Label(rz, text=f"offset: {ui['pressure_offset']:.5f} bar",
+                                   bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
+        ui["zero_lbl"].pack(side="left")
+
+        # Valve Off — press-and-hold 2 s to fire
+        rv = tk.Frame(cg, bg=LFR_BG); rv.pack(fill="x", padx=8, pady=(2, 2))
+        ui["valve_btn"] = tk.Label(
+            rv, text="⛔  Valve OFF  (hold 2 s)",
+            bg="#3d1e1e", fg=FG, font=FONT,
+            padx=10, pady=4, relief="flat", cursor="hand2", anchor="center")
+        ui["valve_btn"].pack(side="left")
+        ui["valve_hint"] = tk.Label(rv, text="", bg=LFR_BG, fg=FG_DIM, font=FONT_SM)
+        ui["valve_hint"].pack(side="left", padx=(8, 0))
+        ui["valve_after_id"] = None
+        ui["valve_press_time"] = None
+        ui["sp_ramp_thread"] = None
+        ui["sp_ramp_stop"] = threading.Event()
+
+        def _valve_press(event, i=idx):
+            ui2 = self._alicat_ui[i]
+            ui2["valve_press_time"] = self.tk.call("clock", "milliseconds")
+            ui2["valve_btn"].configure(bg="#7a2020")
+            ui2["valve_hint"].configure(text="Hold…  2.0 s", fg=AMBER)
+            _valve_tick_fn(i)
+
+        def _valve_tick_fn(i):
+            ui2 = self._alicat_ui[i]
+            if ui2["valve_press_time"] is None:
+                return
+            now   = self.tk.call("clock", "milliseconds")
+            held  = (now - ui2["valve_press_time"]) / 1000.0
+            left  = max(0.0, 2.0 - held)
+            if left <= 0:
+                _valve_fire_fn(i)
+                return
+            ui2["valve_hint"].configure(text=f"Hold…  {left:.1f} s", fg=AMBER)
+            ui2["valve_after_id"] = self.after(50, lambda i2=i: _valve_tick_fn(i2))
+
+        def _valve_release(event, i=idx):
+            ui2 = self._alicat_ui[i]
+            if ui2["valve_press_time"] is None:
+                return
+            if ui2["valve_after_id"]:
+                self.after_cancel(ui2["valve_after_id"])
+                ui2["valve_after_id"] = None
+            ui2["valve_press_time"] = None
+            ui2["valve_btn"].configure(bg="#3d1e1e")
+            ui2["valve_hint"].configure(text="")
+
+        def _valve_fire_fn(i):
+            ui2 = self._alicat_ui[i]
+            if ui2["valve_after_id"]:
+                self.after_cancel(ui2["valve_after_id"])
+                ui2["valve_after_id"] = None
+            ui2["valve_press_time"] = None
+            ui2["valve_btn"].configure(bg="#3d1e1e")
+            ui2["valve_hint"].configure(text="✓ Sent SP → 0", fg=GREEN)
+            self.after(2000, lambda: ui2["valve_hint"].configure(text=""))
+            al = self._alicats[i]
+            if al.is_connected:
+                try:
+                    al.set_setpoint(0.0)
+                except Exception as exc:
+                    ui2["valve_hint"].configure(text=f"Error: {exc}", fg="#e05555")
+            else:
+                ui2["valve_hint"].configure(text="Not connected", fg=FG_DIM)
+
+        ui["valve_btn"].bind("<ButtonPress-1>",   _valve_press)
+        ui["valve_btn"].bind("<ButtonRelease-1>", _valve_release)
+
+        ui["ctl_status_lbl"] = tk.Label(
+            cg, text="Not connected", bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
+        ui["ctl_status_lbl"].pack(fill="x", padx=8, pady=(2, 8))
+
+        self._alicat_ui[idx] = ui
+        if HAS_SERIAL:
+            self._scan_ports(idx)
 
     # ── File loading ───────────────────────────────────────────────────────
+
+    def _clear_csv(self):
+        self._csv_path = None
+        self._df       = pd.DataFrame()
+        self._file_lbl.configure(text="  no file loaded  ", fg=FG_DIM)
+        self._redraw()
 
     def _open_csv(self):
         path = filedialog.askopenfilename(
@@ -1138,7 +1271,8 @@ class MASMonitor(tk.Tk):
 
         handles = []
         if "pressure" in adf.columns:
-            vals = pd.to_numeric(adf["pressure"], errors="coerce") - self._pressure_offset
+            _poff = self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS)
+            vals = pd.to_numeric(adf["pressure"], errors="coerce") - _poff
             l, = ax.plot(ta, vals, lw=0.85, color=C_PRESS, label="Pressure")
             handles.append(l)
             ax.set_ylabel("Pressure (barg)", color=C_PRESS)
@@ -1179,7 +1313,7 @@ class MASMonitor(tk.Tk):
         x = merged["frequency_hz"] * mult
         y = pd.to_numeric(merged[col], errors="coerce")
         if col == "pressure":
-            y = y - self._pressure_offset
+            y = y - self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS)
         mask = x.notna() & y.notna()
         if mask.sum() < 2:
             ax.text(0.5, 0.5, "Insufficient overlap", ha="center", va="center",
@@ -1210,13 +1344,14 @@ class MASMonitor(tk.Tk):
     # ── Alicat ─────────────────────────────────────────────────────────────
 
     def _get_alicat_df(self) -> pd.DataFrame:
-        """Return the best available Alicat dataset.
+        """Return the best available Alicat A dataset.
 
         Priority: live serial data (if connected, even before logging starts)
         → loaded historical file.
         """
-        if self._alicat.is_connected:
-            live = self._alicat.get_dataframe()
+        al = self._alicats[0]
+        if al.is_connected:
+            live = al.get_dataframe()
             if not live.empty:
                 return live
         return self._alicat_file_df
@@ -1249,158 +1384,200 @@ class MASMonitor(tk.Tk):
         self._status("Alicat file cleared.")
         self._redraw()
 
-    def _scan_ports(self):
+    def _scan_ports(self, idx: int = 0):
         if not HAS_SERIAL:
             return
         ports = [p.device for p in serial.tools.list_ports.comports()]
-        self._port_cb["values"] = ports
-        if ports and not self._port_var.get():
-            self._port_var.set(ports[0])
+        ui = self._alicat_ui[idx]
+        if not ui:
+            return
+        ui["port_cb"]["values"] = ports
+        if ports and not ui["port_var"].get():
+            ui["port_var"].set(ports[0])
 
-    def _browse_alicat_csv(self):
+    def _browse_alicat_csv(self, idx: int = 0):
         path = filedialog.asksaveasfilename(
-            title="Alicat log file",
+            title=f"Alicat {'A' if idx == 0 else 'B'} log file",
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialfile="alicat_log.csv",
+            initialfile=f"alicat_{'a' if idx == 0 else 'b'}_log.csv",
         )
         if path:
-            self._alicat_csv_path = Path(path)
-            self._alicat_csv_lbl.configure(
-                text=f"  {self._alicat_csv_path.name}  ", fg=FG)
+            self._alicat_csv_path[idx] = Path(path)
+            ui = self._alicat_ui[idx]
+            if ui.get("status_lbl"):
+                ui["status_lbl"].configure(
+                    text=f"  {self._alicat_csv_path[idx].name}  ", fg=FG)
 
-    def _toggle_alicat_conn(self):
-        if self._alicat.is_connected:
-            self._alicat_logging = False
-            self._stop_live_redraw()
-            self._alicat.disconnect()
-            self._conn_btn.configure(text="Connect")
-            self._log_btn.configure(state="disabled", text="▶  Start logging")
-            self._alicat_lbl.configure(text="Disconnected.", fg=FG_DIM)
-            if hasattr(self, "_ctl_status_lbl"):
-                self._ctl_status_lbl.configure(text="Not connected", fg=FG_DIM)
-            for lbl in (self._ctl_p_lbl, self._ctl_t_lbl,
-                        self._ctl_q_lbl, self._ctl_sp_lbl):
-                lbl.configure(text="–")
+    def _toggle_alicat_conn(self, idx: int = 0):
+        al = self._alicats[idx]
+        ui = self._alicat_ui[idx]
+        lname = f"Alicat {'A' if idx == 0 else 'B'}"
+        if al.is_connected:
+            self._alicat_logging[idx] = False
+            if idx == 0:
+                self._stop_live_redraw()
+            al.disconnect()
+            if ui.get("conn_btn"):
+                ui["conn_btn"].configure(text="Connect")
+            if ui.get("log_btn"):
+                ui["log_btn"].configure(state="disabled", text="▶  Start logging")
+            if ui.get("alicat_lbl"):
+                ui["alicat_lbl"].configure(text=f"{lname}  —  Disconnected.", fg=FG_DIM)
+            if ui.get("ctl_status_lbl"):
+                ui["ctl_status_lbl"].configure(text="Not connected", fg=FG_DIM)
+            for key in ("ctl_p_lbl", "ctl_t_lbl", "ctl_q_lbl", "ctl_sp_lbl"):
+                if ui.get(key):
+                    ui[key].configure(text="–")
+            # Hide Alicat B panel when disconnected
+            if idx == 1 and ui.get("panel_frame"):
+                ui["panel_frame"].pack_forget()
             self._redraw()
         else:
-            port = self._port_var.get()
+            port = ui.get("port_var", tk.StringVar()).get() if ui else ""
             if not port:
-                messagebox.showwarning("Alicat", "Select a serial port first.")
+                messagebox.showwarning(lname, "Select a serial port first.")
                 return
             try:
-                baud = int(self._baud_var.get())
-                self._alicat = AlicatLogger(port, address=self._addr_var.get())
-                self._alicat.connect(baud=baud)
-                self._conn_btn.configure(text="Disconnect")
-                self._log_btn.configure(state="normal")
-                self._alicat_lbl.configure(text=f"Connected: {port}", fg=GREEN)
-                if hasattr(self, "_ctl_status_lbl"):
-                    self._ctl_status_lbl.configure(
+                baud = int(ui["baud_var"].get())
+                new_al = AlicatLogger(port, address=ui["addr_var"].get())
+                new_al.connect(baud=baud)
+                self._alicats[idx] = new_al
+                if idx == 0:
+                    self._alicat = new_al
+                # Reset pressure offset on new connection
+                ui["pressure_offset"] = LOCAL_ATMOS
+                if ui.get("zero_lbl"):
+                    ui["zero_lbl"].configure(
+                        text=f"offset: {ui['pressure_offset']:.5f} bar", fg=FG_DIM)
+                if ui.get("conn_btn"):
+                    ui["conn_btn"].configure(text="Disconnect")
+                if ui.get("log_btn"):
+                    ui["log_btn"].configure(state="normal")
+                if ui.get("alicat_lbl"):
+                    ui["alicat_lbl"].configure(text=f"{lname}  —  Connected: {port}", fg=GREEN)
+                if ui.get("ctl_status_lbl"):
+                    ui["ctl_status_lbl"].configure(
                         text=f"Connected  ·  {port}", fg=GREEN)
-                self._start_live_redraw()
+                # Show Alicat B panel when connected
+                if idx == 1 and ui.get("panel_frame"):
+                    ui["panel_frame"].pack(side="left", padx=(0, 10), fill="y", pady=2)
+                if idx == 0:
+                    self._start_live_redraw()
             except Exception as exc:
-                messagebox.showerror("Alicat", str(exc))
+                messagebox.showerror(lname, str(exc))
 
-    def _toggle_alicat_log(self):
-        if not self._alicat.is_connected:
+    def _toggle_alicat_log(self, idx: int = 0):
+        al = self._alicats[idx]
+        if not al.is_connected:
             return
-        self._alicat_logging = not self._alicat_logging
-        if self._alicat_logging:
-            # Start CSV file logging if a path is set
-            if self._alicat_csv_path:
+        ui = self._alicat_ui[idx]
+        lname = f"Alicat {'A' if idx == 0 else 'B'}"
+        self._alicat_logging[idx] = not self._alicat_logging[idx]
+        if self._alicat_logging[idx]:
+            csv_path = self._alicat_csv_path[idx]
+            if csv_path:
                 try:
-                    self._alicat.start_csv_log(self._alicat_csv_path)
-                    csv_note = f"  →  {self._alicat_csv_path.name}"
+                    al.start_csv_log(csv_path)
+                    csv_note = f"  →  {csv_path.name}"
                 except Exception as exc:
-                    messagebox.showerror("Alicat CSV", f"Could not open log file:\n{exc}")
-                    self._alicat_logging = False
+                    messagebox.showerror(f"{lname} CSV", f"Could not open log file:\n{exc}")
+                    self._alicat_logging[idx] = False
                     return
             else:
                 csv_note = "  (no CSV file set)"
-            self._log_btn.configure(text="⏹  Stop logging")
-            self._alicat_lbl.configure(
-                text=f"Logging{csv_note}", fg=GREEN)
+            if ui.get("log_btn"):
+                ui["log_btn"].configure(text="⏹  Stop logging")
+            if ui.get("alicat_lbl"):
+                ui["alicat_lbl"].configure(text=f"{lname}  —  Logging{csv_note}", fg=GREEN)
         else:
-            self._alicat.stop_csv_log()
-            self._log_btn.configure(text="▶  Start logging")
-            self._alicat_lbl.configure(text="Connected (paused)", fg=ACCENT)
+            al.stop_csv_log()
+            if ui.get("log_btn"):
+                ui["log_btn"].configure(text="▶  Start logging")
+            if ui.get("alicat_lbl"):
+                ui["alicat_lbl"].configure(text=f"{lname}  —  Connected (paused)", fg=ACCENT)
 
     def _poll_alicat_status(self):
-        if self._alicat.is_connected:
-            r = self._alicat.last_reading
-            if r:
-                # Update status label
-                parts = []
-                for k, lbl in [("pressure", "P"), ("temperature", "T"), ("mass_flow", "Q")]:
-                    if k in r:
-                        try:
-                            parts.append(f"{lbl}: {float(r[k]):.2f}")
-                        except (ValueError, TypeError):
-                            pass
-                rows = self._alicat.csv_rows_written
-                csv_info = f"  [{rows} rows→CSV]" if rows > 0 and self._alicat_logging else ""
-                if parts and hasattr(self, "_alicat_lbl"):
-                    self._alicat_lbl.configure(
-                        text="   ".join(parts) + csv_info, fg=GREEN)
+        for idx in range(2):
+            al = self._alicats[idx]
+            ui = self._alicat_ui[idx]
+            if not ui:
+                continue
+            lname = f"Alicat {'A' if idx == 0 else 'B'}"
+            if al.is_connected:
+                r = al.last_reading
+                if r:
+                    parts = []
+                    for k, lbl in [("pressure", "P"), ("temperature", "T"), ("mass_flow", "Q")]:
+                        if k in r:
+                            try:
+                                parts.append(f"{lbl}: {float(r[k]):.2f}")
+                            except (ValueError, TypeError):
+                                pass
+                    rows = al.csv_rows_written
+                    csv_info = f"  [{rows} rows→CSV]" if rows > 0 and self._alicat_logging[idx] else ""
+                    if parts and ui.get("alicat_lbl"):
+                        ui["alicat_lbl"].configure(
+                            text=f"{lname}  —  " + "   ".join(parts) + csv_info, fg=GREEN)
+                    self._update_control_readout(r, idx)
 
-                # Update control panel tiles
-                self._update_control_readout(r)
-
-            if self._alicat.error:
-                err_msg = f"Error: {self._alicat.error}"
-                if hasattr(self, "_alicat_lbl"):
-                    self._alicat_lbl.configure(text=err_msg, fg=RED)
-                if hasattr(self, "_ctl_status_lbl"):
-                    raw_preview = self._alicat.last_raw[:50] if self._alicat.last_raw else ""
-                    self._ctl_status_lbl.configure(
-                        text=f"{err_msg}  ·  last raw: {raw_preview!r}", fg=RED)
-            elif not self._alicat.last_reading and hasattr(self, "_ctl_status_lbl"):
-                # Connected but no successful reading yet — show raw to help debug
-                raw_preview = self._alicat.last_raw[:60] if self._alicat.last_raw else "waiting for response…"
-                n_readings = len(self._alicat._data)
-                self._ctl_status_lbl.configure(
-                    text=f"{n_readings} readings  ·  raw: {raw_preview!r}", fg=AMBER)
+                if al.error:
+                    err_msg = f"Error: {al.error}"
+                    if ui.get("alicat_lbl"):
+                        ui["alicat_lbl"].configure(text=f"{lname}  —  {err_msg}", fg=RED)
+                    if ui.get("ctl_status_lbl"):
+                        raw_preview = al.last_raw[:50] if al.last_raw else ""
+                        ui["ctl_status_lbl"].configure(
+                            text=f"{err_msg}  ·  last raw: {raw_preview!r}", fg=RED)
+                elif not al.last_reading and ui.get("ctl_status_lbl"):
+                    raw_preview = al.last_raw[:60] if al.last_raw else "waiting for response…"
+                    n_readings = len(al._data)
+                    ui["ctl_status_lbl"].configure(
+                        text=f"{n_readings} readings  ·  raw: {raw_preview!r}", fg=AMBER)
 
         self.after(1000, self._poll_alicat_status)
 
-    def _update_control_readout(self, r: dict):
-        """Push latest Alicat reading into the control-panel tiles."""
-        if not hasattr(self, "_ctl_p_lbl"):
+    def _update_control_readout(self, r: dict, idx: int = 0):
+        """Push latest Alicat reading into the control-panel tiles for given index."""
+        ui = self._alicat_ui[idx]
+        if not ui or not ui.get("ctl_p_lbl"):
             return
+        al = self._alicats[idx]
+        offset = ui.get("pressure_offset", LOCAL_ATMOS)
 
         def _fmt(key, decimals=3):
             try:
                 v = float(r[key])
                 if key in ("pressure", "setpoint"):
-                    v -= self._pressure_offset
+                    v -= offset
                 return f"{v:.{decimals}f}"
             except (KeyError, ValueError, TypeError):
                 return "–"
 
-        self._ctl_p_lbl.configure(text=_fmt("pressure", 4))
-        self._ctl_t_lbl.configure(text=_fmt("temperature", 2))
-        self._ctl_q_lbl.configure(text=_fmt("mass_flow", 4))
-        sp_str = _fmt("setpoint", 4)
-        self._ctl_sp_lbl.configure(text=sp_str)
+        ui["ctl_p_lbl"].configure(text=_fmt("pressure", 4))
+        ui["ctl_t_lbl"].configure(text=_fmt("temperature", 2))
+        ui["ctl_q_lbl"].configure(text=_fmt("mass_flow", 4))
+        ui["ctl_sp_lbl"].configure(text=_fmt("setpoint", 4))
 
-        n_readings = len(self._alicat._data)
-        rows = self._alicat.csv_rows_written
-        log_info = f"  ·  {rows} rows→CSV" if rows > 0 and self._alicat_logging else ""
-        raw_preview = self._alicat.last_raw[:60] if self._alicat.last_raw else "waiting…"
-        self._ctl_status_lbl.configure(
+        n_readings = len(al._data)
+        rows = al.csv_rows_written
+        log_info = f"  ·  {rows} rows→CSV" if rows > 0 and self._alicat_logging[idx] else ""
+        raw_preview = al.last_raw[:60] if al.last_raw else "waiting…"
+        ui["ctl_status_lbl"].configure(
             text=f"{n_readings} readings  ·  {raw_preview}{log_info}", fg=GREEN)
 
-    def _open_serial_monitor(self):
+    def _open_serial_monitor(self, idx: int = 0):
         """Open a live scrolling window showing raw TX/RX bytes."""
+        al = self._alicats[idx]
+        lname = f"Alicat {'A' if idx == 0 else 'B'}"
         win = tk.Toplevel(self)
-        win.title("Serial monitor")
+        win.title(f"Serial monitor  —  {lname}")
         win.configure(bg=BG)
         win.geometry("700x400")
 
         hdr = tk.Frame(win, bg=BG_PANEL, pady=4, padx=8)
         hdr.pack(fill="x")
-        tk.Label(hdr, text="Raw serial log  (TX → device, RX ← device)",
+        tk.Label(hdr, text=f"{lname}  raw serial log  (TX → device, RX ← device)",
                  bg=BG_PANEL, fg=FG_DIM, font=FONT_SM, anchor="w").pack(side="left")
 
         # Manual TX entry
@@ -1427,11 +1604,11 @@ class MASMonitor(tk.Tk):
         txt.tag_configure("hex", foreground=AMBER)
 
         def _manual_send():
-            if not self._alicat.is_connected:
+            if not al.is_connected:
                 return
             raw = tx_var.get().replace("\\r", "\r").replace("\\n", "\n")
             try:
-                c = self._alicat._conn
+                c = al._conn
                 c.reset_input_buffer()
                 c.rts = True
                 c.write(raw.encode())
@@ -1457,7 +1634,7 @@ class MASMonitor(tk.Tk):
         def _refresh():
             if not win.winfo_exists():
                 return
-            log = list(self._alicat._raw_log)
+            log = list(al._raw_log)
             if len(log) != last_len[0]:
                 txt.delete("1.0", "end")
                 for line in log:
@@ -1745,58 +1922,64 @@ class MASMonitor(tk.Tk):
         self._routine_lbl.configure(text=self._routine_status)
         self.after(250, self._poll_routine_status)
 
-    def _zero_pressure(self):
-        """Capture the current absolute pressure reading as the gauge-zero offset."""
-        raw = None
-        if self._alicat.is_connected and self._alicat.last_reading:
-            raw = self._alicat.last_reading.get("pressure")
-        if raw is None:
-            messagebox.showwarning("Zero P",
-                "No live pressure reading available.\n"
-                "Connect the Alicat and wait for at least one poll.")
-            return
-        self._pressure_offset = float(raw)
-        self._zero_lbl.configure(
-            text=f"offset: {self._pressure_offset:.5f} bar", fg=GREEN)
+    def _clear_pressure_offset(self, idx: int = 0):
+        """Reset offset to local atmospheric (Zurich ~0.953 bar) for normal gauge display."""
+        ui = self._alicat_ui[idx]
+        ui["pressure_offset"] = LOCAL_ATMOS
+        ui["zero_lbl"].configure(
+            text=f"offset: {LOCAL_ATMOS:.5f} bar", fg=FG_DIM)
         self._redraw()
 
-    def _send_setpoint(self):
-        if not self._alicat.is_connected:
+    def _zero_pressure(self, idx: int = 0):
+        """Set offset to 0.0 — display shows raw absolute pressure.
+        In this mode SP=0 sends a true absolute zero to the device (fully closes valve)."""
+        ui = self._alicat_ui[idx]
+        ui["pressure_offset"] = 0.0
+        ui["zero_lbl"].configure(
+            text="offset: 0.00000 bar  (absolute mode)", fg=AMBER)
+        self._redraw()
+
+    def _send_setpoint(self, idx: int = 0):
+        al  = self._alicats[idx]
+        ui  = self._alicat_ui[idx]
+        if not al.is_connected:
             messagebox.showwarning("Alicat", "Not connected.")
             return
         try:
-            # User enters gauge pressure (barg); convert to absolute for the device
-            target_gauge = float(self._sp_entry_var.get())
-            target = target_gauge + self._pressure_offset
+            # User enters gauge value; add offset to get absolute for the device
+            target_gauge = float(ui["sp_entry_var"].get())
+            offset       = ui.get("pressure_offset", LOCAL_ATMOS)
+            target       = target_gauge + offset
         except ValueError:
             messagebox.showerror("Setpoint", "Enter a valid number.")
             return
         try:
-            ramp = max(0.0, float(self._sp_ramp_var.get()))
+            ramp = max(0.0, float(ui["sp_ramp_var"].get()))
         except ValueError:
             ramp = 0.0
 
-        # Cancel any in-progress ramp
-        if self._sp_ramp_thread and self._sp_ramp_thread.is_alive():
-            self._sp_ramp_stop.set()
-            self._sp_ramp_thread.join(timeout=1.0)
-        self._sp_ramp_stop.clear()
+        # Cancel any in-progress ramp for this unit
+        thr = ui.get("sp_ramp_thread")
+        stp = ui["sp_ramp_stop"]
+        if thr and thr.is_alive():
+            stp.set()
+            thr.join(timeout=1.0)
+        stp.clear()
+
+        status_lbl = ui["ctl_status_lbl"]
 
         if ramp <= 0.0:
             try:
-                self._alicat.set_setpoint(target)
-                self._ctl_status_lbl.configure(
-                    text=f"Setpoint → {target:.4f} sent", fg=ACCENT)
+                al.set_setpoint(target)
+                status_lbl.configure(text=f"Setpoint → {target:.4f} sent", fg=ACCENT)
             except Exception as exc:
                 messagebox.showerror("Setpoint", str(exc))
         else:
-            def _do_ramp():
-                # Start from device's current setpoint (absolute) if available
+            def _do_ramp(al=al, target=target, ramp=ramp, stp=stp, status_lbl=status_lbl):
                 current = target
-                if self._alicat.last_reading:
+                if al.last_reading:
                     try:
-                        current = float(self._alicat.last_reading.get("setpoint", target))
-                        # last_reading["setpoint"] is absolute; target is also absolute here
+                        current = float(al.last_reading.get("setpoint", target))
                     except (TypeError, ValueError):
                         pass
                 direction = 1.0 if target > current else -1.0
@@ -1804,30 +1987,31 @@ class MASMonitor(tk.Tk):
                     return
                 TICK = 0.25
                 step = ramp * TICK
-                self.after(0, lambda: self._ctl_status_lbl.configure(
+                self.after(0, lambda: status_lbl.configure(
                     text=f"Ramping → {target:.4f}  ({ramp:.4f}/s) …", fg=AMBER))
                 while direction * (target - current) > 1e-6:
-                    if self._sp_ramp_stop.is_set():
-                        self.after(0, lambda: self._ctl_status_lbl.configure(
+                    if stp.is_set():
+                        self.after(0, lambda: status_lbl.configure(
                             text="Ramp cancelled", fg=FG_DIM))
                         return
                     current = min(target, current + direction * step) if direction > 0 \
                               else max(target, current + direction * step)
                     try:
-                        self._alicat.set_setpoint(current)
+                        al.set_setpoint(current)
                     except Exception as exc:
-                        self.after(0, lambda e=exc: self._ctl_status_lbl.configure(
+                        self.after(0, lambda e=exc: status_lbl.configure(
                             text=f"Ramp error: {e}", fg="#e05555"))
                         return
                     v = current
-                    self.after(0, lambda v=v: self._ctl_status_lbl.configure(
+                    self.after(0, lambda v=v: status_lbl.configure(
                         text=f"Ramping… SP {v:.4f}", fg=AMBER))
                     time.sleep(TICK)
-                self.after(0, lambda: self._ctl_status_lbl.configure(
+                self.after(0, lambda: status_lbl.configure(
                     text=f"Setpoint → {target:.4f} reached", fg=ACCENT))
 
-            self._sp_ramp_thread = threading.Thread(target=_do_ramp, daemon=True)
-            self._sp_ramp_thread.start()
+            t = threading.Thread(target=_do_ramp, daemon=True)
+            ui["sp_ramp_thread"] = t
+            t.start()
 
     _GAS_IDS = {
         "Air":  0,
@@ -1841,14 +2025,16 @@ class MASMonitor(tk.Tk):
         "N₂":   8,
     }
 
-    def _send_gas(self):
-        if not self._alicat.is_connected:
+    def _send_gas(self, idx: int = 0):
+        al = self._alicats[idx]
+        ui = self._alicat_ui[idx]
+        if not al.is_connected:
             return
-        gas  = self._gas_var.get()
-        gid  = self._GAS_IDS.get(gas, 0)
+        gas = ui["gas_var"].get()
+        gid = self._GAS_IDS.get(gas, 0)
         try:
-            self._alicat.set_gas(gid)
-            self._ctl_status_lbl.configure(text=f"Gas → {gas} sent", fg=ACCENT)
+            al.set_gas(gid)
+            ui["ctl_status_lbl"].configure(text=f"Gas → {gas} sent", fg=ACCENT)
         except Exception as exc:
             messagebox.showerror("Gas", str(exc))
 
@@ -1984,7 +2170,7 @@ class MASMonitor(tk.Tk):
             ta = pd.to_datetime(alic["timestamp"])
             if "pressure" in alic.columns:
                 ax_g.plot(ta,
-                          pd.to_numeric(alic["pressure"], errors="coerce") - self._pressure_offset,
+                          pd.to_numeric(alic["pressure"], errors="coerce") - self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS),
                           lw=0.8, color=C_PRESS, label="Pressure")
                 ax_g.set_ylabel("Pressure (barg)", color=C_PRESS)
             if "mass_flow" in alic.columns:
@@ -2008,7 +2194,7 @@ class MASMonitor(tk.Tk):
                     x = merged["frequency_hz"] * mult
                     y = pd.to_numeric(merged[col], errors="coerce")
                     if col == "pressure":
-                        y = y - self._pressure_offset
+                        y = y - self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS)
                     mask = x.notna() & y.notna()
                     if mask.sum() >= 2:
                         idx = np.arange(mask.sum())
