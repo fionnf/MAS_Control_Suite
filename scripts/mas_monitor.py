@@ -623,51 +623,57 @@ class MASMonitor(tk.Tk):
         tb_frame.grid(row=1, column=0, sticky="ew")
         NavigationToolbar2Tk(self._canvas, tb_frame)
 
-    # -- controls strip ----------------------------------------------------
+    # -- controls panel (tabbed) -------------------------------------------
 
     def _build_controls(self):
-        # Outer container — holds the scrollable canvas + scrollbar
         outer = tk.Frame(self, bg=BG_PANEL)
         outer.grid(row=2, column=0, sticky="ew")
         outer.columnconfigure(0, weight=1)
 
-        # Horizontal scrollbar (only visible when needed)
-        hbar = tk.Scrollbar(outer, orient="horizontal", bg=BG_PANEL,
-                            troughcolor=BG_ENTRY, width=8)
-        hbar.grid(row=1, column=0, sticky="ew")
+        # ── Tab bar ──
+        tab_bar = tk.Frame(outer, bg=BG_PANEL)
+        tab_bar.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 0))
 
-        scr_canvas = tk.Canvas(outer, bg=BG_PANEL, highlightthickness=0,
-                               height=1, xscrollcommand=hbar.set)
-        scr_canvas.grid(row=0, column=0, sticky="ew")
-        hbar.config(command=scr_canvas.xview)
+        content = tk.Frame(outer, bg=BG_PANEL)
+        content.grid(row=1, column=0, sticky="ew")
+        content.columnconfigure(0, weight=1)
 
-        # The real strip lives inside the canvas
-        strip = tk.Frame(scr_canvas, bg=BG_PANEL, padx=8, pady=6)
-        strip_id = scr_canvas.create_window((0, 0), window=strip, anchor="nw")
+        self._tab_frames: dict[str, tk.Frame] = {}
+        self._tab_btns:   dict[str, tk.Label] = {}
 
-        def _on_strip_configure(event):
-            scr_canvas.configure(scrollregion=scr_canvas.bbox("all"),
-                                 height=strip.winfo_reqheight())
+        def _show_tab(name: str):
+            for n, f in self._tab_frames.items():
+                f.grid_remove()
+            self._tab_frames[name].grid(row=0, column=0, sticky="ew")
+            for n, b in self._tab_btns.items():
+                b.configure(bg=BTN_BG)
+                b._bg = BTN_BG
+            self._tab_btns[name].configure(bg=ACCENT)
+            self._tab_btns[name]._bg = ACCENT
 
-        def _on_canvas_configure(event):
-            # If strip fits, no need to scroll — hide scrollbar
-            if strip.winfo_reqwidth() <= event.width:
-                hbar.grid_remove()
-                scr_canvas.itemconfigure(strip_id, width=event.width)
-            else:
-                hbar.grid()
-                scr_canvas.itemconfigure(strip_id, width=strip.winfo_reqwidth())
+        def _make_tab(label: str) -> tk.Frame:
+            btn = _Btn(tab_bar, text=label, command=lambda l=label: _show_tab(l),
+                       bg=BTN_BG)
+            btn.pack(side="left", padx=(0, 2))
+            frame = tk.Frame(content, bg=BG_PANEL, padx=8, pady=6)
+            frame.columnconfigure(0, weight=1)
+            self._tab_frames[label] = frame
+            self._tab_btns[label]   = btn
+            return frame
 
-        strip.bind("<Configure>", _on_strip_configure)
-        scr_canvas.bind("<Configure>", _on_canvas_configure)
+        freq_tab = _make_tab("Frequency")
+        gas_tab  = _make_tab("Gas & Control")
+        exp_tab  = _make_tab("Export")
 
-        # Mouse-wheel horizontal scroll (Shift+scroll or trackpad)
-        def _on_hscroll(event):
-            scr_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
-        scr_canvas.bind("<Shift-MouseWheel>", _on_hscroll)
+        # ════════════════════════════════════════════════
+        # TAB 1 — Frequency display settings
+        # ════════════════════════════════════════════════
+        strip = freq_tab
+        strip.columnconfigure(0, weight=0)
 
-        # ── Display ──
-        dg = _group(strip, "Display")
+        row = tk.Frame(strip, bg=BG_PANEL); row.pack(fill="x")
+
+        dg = _group(row, "Display")
         dg.pack(side="left", padx=(0, 10), fill="y", pady=2)
 
         r = tk.Frame(dg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(6, 2))
@@ -691,12 +697,10 @@ class MASMonitor(tk.Tk):
 
         r = tk.Frame(dg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=2)
         self._despike_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            r, text="Despike", variable=self._despike_var,
-            bg=LFR_BG, fg=FG, font=FONT,
-            selectcolor=BG_ENTRY, activebackground=LFR_BG, activeforeground=FG,
-            command=self._redraw,
-        ).pack(side="left")
+        tk.Checkbutton(r, text="Despike", variable=self._despike_var,
+            bg=LFR_BG, fg=FG, font=FONT, selectcolor=BG_ENTRY,
+            activebackground=LFR_BG, activeforeground=FG,
+            command=self._redraw).pack(side="left")
         _label2(r, "  thresh:").pack(side="left")
         self._despike_thresh_var = tk.StringVar(value="3.0")
         dt = _combo(r, self._despike_thresh_var, DESPIKE_THRESH, width=4)
@@ -705,20 +709,16 @@ class MASMonitor(tk.Tk):
         _label2(r, "σ").pack(side="left", padx=(3, 0))
 
         r = tk.Frame(dg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=2)
-        self._show_mean_var = tk.BooleanVar(value=True)
+        self._show_mean_var  = tk.BooleanVar(value=True)
         self._show_sigma_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            r, text="Mean line", variable=self._show_mean_var,
-            bg=LFR_BG, fg=FG, font=FONT,
-            selectcolor=BG_ENTRY, activebackground=LFR_BG, activeforeground=FG,
-            command=self._redraw,
-        ).pack(side="left", padx=(0, 10))
-        tk.Checkbutton(
-            r, text="±1σ band", variable=self._show_sigma_var,
-            bg=LFR_BG, fg=FG, font=FONT,
-            selectcolor=BG_ENTRY, activebackground=LFR_BG, activeforeground=FG,
-            command=self._redraw,
-        ).pack(side="left")
+        tk.Checkbutton(r, text="Mean line", variable=self._show_mean_var,
+            bg=LFR_BG, fg=FG, font=FONT, selectcolor=BG_ENTRY,
+            activebackground=LFR_BG, activeforeground=FG,
+            command=self._redraw).pack(side="left", padx=(0, 10))
+        tk.Checkbutton(r, text="±1σ band", variable=self._show_sigma_var,
+            bg=LFR_BG, fg=FG, font=FONT, selectcolor=BG_ENTRY,
+            activebackground=LFR_BG, activeforeground=FG,
+            command=self._redraw).pack(side="left")
 
         r = tk.Frame(dg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(2, 8))
         _label2(r, "Show last:").pack(side="left")
@@ -727,8 +727,13 @@ class MASMonitor(tk.Tk):
         wc.pack(side="left", padx=(6, 0))
         wc.bind("<<ComboboxSelected>>", lambda _: self._redraw())
 
-        # ── Alicat ──
-        ag = _group(strip, "Alicat flow / pressure meter")
+        # ════════════════════════════════════════════════
+        # TAB 2 — Gas & Pressure Control
+        # ════════════════════════════════════════════════
+        row2 = tk.Frame(gas_tab, bg=BG_PANEL); row2.pack(fill="x")
+
+        # ── Alicat connection ──
+        ag = _group(row2, "Alicat flow / pressure meter")
         ag.pack(side="left", padx=(0, 10), fill="y", pady=2)
 
         if not HAS_SERIAL:
@@ -748,51 +753,44 @@ class MASMonitor(tk.Tk):
             self._addr_var = tk.StringVar(value="A")
             _entry(r0, self._addr_var, width=3).pack(side="left", padx=(4, 0))
 
-            # Load historical Alicat CSV
             r_load = tk.Frame(ag, bg=LFR_BG); r_load.pack(fill="x", padx=8, pady=(0, 2))
             _label2(r_load, "Load file:").pack(side="left")
             self._alicat_file_lbl = tk.Label(
                 r_load, text="  no file loaded  ",
                 bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
                 relief="flat", bd=0, padx=4, pady=1, anchor="w", width=24,
-                highlightbackground=BORDER, highlightthickness=1,
-            )
+                highlightbackground=BORDER, highlightthickness=1)
             self._alicat_file_lbl.pack(side="left", padx=(4, 4))
             _btn(r_load, "Open…", self._open_alicat_file).pack(side="left", padx=(0, 4))
             _btn(r_load, "✕", self._clear_alicat_file, width=2).pack(side="left")
 
-            # CSV log file path
             r_csv = tk.Frame(ag, bg=LFR_BG); r_csv.pack(fill="x", padx=8, pady=(0, 2))
             _label2(r_csv, "Log CSV:").pack(side="left")
             self._alicat_csv_lbl = tk.Label(
                 r_csv, text="  not set  ",
                 bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
                 relief="flat", bd=0, padx=4, pady=1, anchor="w", width=24,
-                highlightbackground=BORDER, highlightthickness=1,
-            )
+                highlightbackground=BORDER, highlightthickness=1)
             self._alicat_csv_lbl.pack(side="left", padx=(4, 4))
             _btn(r_csv, "Browse…", self._browse_alicat_csv).pack(side="left")
 
             r1 = tk.Frame(ag, bg=LFR_BG); r1.pack(fill="x", padx=8, pady=(2, 2))
             self._conn_btn = _btn(r1, "Connect", self._toggle_alicat_conn)
             self._conn_btn.pack(side="left", padx=(0, 8))
-            self._log_btn  = _btn(r1, "▶  Start logging", self._toggle_alicat_log)
+            self._log_btn = _btn(r1, "▶  Start logging", self._toggle_alicat_log)
             self._log_btn.configure(state="disabled")
             self._log_btn.pack(side="left", padx=(0, 8))
             _btn(r1, "Serial monitor…", self._open_serial_monitor).pack(side="left")
 
             self._alicat_lbl = tk.Label(
-                ag, text="Not connected",
-                bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w"
-            )
+                ag, text="Not connected", bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
             self._alicat_lbl.pack(fill="x", padx=8, pady=(2, 8))
             self._scan_ports()
 
         # ── Pressure Control ──
-        cg = _group(strip, "Pressure control")
+        cg = _group(row2, "Pressure control")
         cg.pack(side="left", padx=(0, 10), fill="y", pady=2)
 
-        # Live readout tiles (2 × 2 grid)
         ro = tk.Frame(cg, bg=LFR_BG); ro.pack(fill="x", padx=8, pady=(6, 2))
 
         def _tile(parent, title, col):
@@ -814,14 +812,13 @@ class MASMonitor(tk.Tk):
             tile.grid(row=0, column=col, padx=(0, 4) if col < 3 else 0, pady=0, sticky="ew")
             ro.columnconfigure(col, weight=1)
 
-        # Units labels (small, below tiles)
         ru = tk.Frame(cg, bg=LFR_BG); ru.pack(fill="x", padx=8, pady=(0, 2))
-        for col, txt in enumerate(["barg", "°C", "slm", "slm"]):
+        for col, txt in enumerate(["barg", "°C", "slm", "barg"]):
             tk.Label(ru, text=txt, bg=LFR_BG, fg=FG_DIM, font=("Helvetica Neue", 9),
-                     anchor="center").grid(row=0, column=col, sticky="ew", padx=(0, 4) if col < 3 else 0)
+                     anchor="center").grid(row=0, column=col, sticky="ew",
+                                           padx=(0, 4) if col < 3 else 0)
             ru.columnconfigure(col, weight=1)
 
-        # Setpoint control row
         rs = tk.Frame(cg, bg=LFR_BG); rs.pack(fill="x", padx=8, pady=(4, 2))
         _label2(rs, "Set SP:").pack(side="left")
         self._sp_entry_var = tk.StringVar(value="0.0000")
@@ -832,7 +829,7 @@ class MASMonitor(tk.Tk):
         _label2(rs, "Ramp:").pack(side="left")
         self._sp_ramp_var = tk.StringVar(value="0")
         _entry(rs, self._sp_ramp_var, width=5).pack(side="left", padx=(4, 2))
-        _label2(rs, "slm/s").pack(side="left", padx=(0, 8))
+        _label2(rs, "barg/s").pack(side="left", padx=(0, 8))
         _label2(rs, "Gas:").pack(side="left")
         self._gas_var = tk.StringVar(value="Air")
         ALICAT_GASES = ["Air", "Ar", "CH₄", "CO", "CO₂", "C₂H₆", "H₂", "He", "N₂"]
@@ -851,7 +848,7 @@ class MASMonitor(tk.Tk):
         self._ctl_status_lbl.pack(fill="x", padx=8, pady=(2, 8))
 
         # ── Spin routine ──
-        rg = _group(strip, "Spin routine")
+        rg = _group(row2, "Spin routine")
         rg.pack(side="left", padx=(0, 10), fill="y", pady=2)
 
         rb = tk.Frame(rg, bg=LFR_BG); rb.pack(fill="x", padx=8, pady=(6, 4))
@@ -865,16 +862,18 @@ class MASMonitor(tk.Tk):
         _btn(rb2, "Edit routines…", self._open_routine_editor).pack(side="left", padx=(0, 12))
         _label2(rb2, "Ramp:").pack(side="left")
         _entry(rb2, self._ramp_rate_var, width=5).pack(side="left", padx=(4, 4))
-        _label2(rb2, "slm/s  (0 = instant)").pack(side="left")
+        _label2(rb2, "barg/s  (0 = instant)").pack(side="left")
 
         self._routine_lbl = tk.Label(
             rg, text="No routine running", bg=LFR_BG, fg=FG_DIM,
             font=FONT_SM, anchor="w")
         self._routine_lbl.pack(fill="x", padx=8, pady=(2, 8))
 
-        # ── Export ──
-        eg = _group(strip, "Export")
-        eg.pack(side="left", fill="y", pady=2)
+        # ════════════════════════════════════════════════
+        # TAB 3 — Export
+        # ════════════════════════════════════════════════
+        eg = _group(exp_tab, "Export")
+        eg.pack(side="left", fill="y", pady=2, padx=(0, 10))
 
         r = tk.Frame(eg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(6, 2))
         _label2(r, "From:").pack(side="left")
@@ -887,6 +886,9 @@ class MASMonitor(tk.Tk):
         _btn(r, "Save plot (PDF)", lambda: self._export_plot("pdf")).pack(side="left", padx=(0, 6))
         _btn(r, "Save plot (PNG)", lambda: self._export_plot("png")).pack(side="left", padx=(0, 6))
         _btn(r, "Save data (CSV)", self._export_csv).pack(side="left")
+
+        # Show Frequency tab by default
+        _show_tab("Frequency")
 
     # -- status bar --------------------------------------------------------
 
@@ -1370,7 +1372,7 @@ class MASMonitor(tk.Tk):
         def _fmt(key, decimals=3):
             try:
                 v = float(r[key])
-                if key == "pressure":
+                if key in ("pressure", "setpoint"):
                     v -= self._pressure_offset
                 return f"{v:.{decimals}f}"
             except (KeyError, ValueError, TypeError):
@@ -1763,7 +1765,9 @@ class MASMonitor(tk.Tk):
             messagebox.showwarning("Alicat", "Not connected.")
             return
         try:
-            target = float(self._sp_entry_var.get())
+            # User enters gauge pressure (barg); convert to absolute for the device
+            target_gauge = float(self._sp_entry_var.get())
+            target = target_gauge + self._pressure_offset
         except ValueError:
             messagebox.showerror("Setpoint", "Enter a valid number.")
             return
@@ -1787,11 +1791,12 @@ class MASMonitor(tk.Tk):
                 messagebox.showerror("Setpoint", str(exc))
         else:
             def _do_ramp():
-                # Start from device's current setpoint if available
+                # Start from device's current setpoint (absolute) if available
                 current = target
                 if self._alicat.last_reading:
                     try:
                         current = float(self._alicat.last_reading.get("setpoint", target))
+                        # last_reading["setpoint"] is absolute; target is also absolute here
                     except (TypeError, ValueError):
                         pass
                 direction = 1.0 if target > current else -1.0
