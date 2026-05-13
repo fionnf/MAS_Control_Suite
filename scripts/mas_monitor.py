@@ -1,0 +1,1655 @@
+#!/usr/bin/env python3
+"""
+MAS Rotor Monitor  —  v2
+========================
+Live dashboard for optically-detected MAS NMR rotors.
+
+  • Reads the frequency-log CSV produced by PicoScope's built-in datalogging
+    function and auto-refreshes as new rows arrive.
+  • Optionally connects to an Alicat flow/pressure meter over serial and logs
+    pressure, temperature, and mass-flow alongside the spin data.
+  • Three-panel live view: spin frequency (time), pressure + flow (time),
+    and correlation scatter plots (freq vs pressure, freq vs flow).
+  • One-click export of publication-quality plots and merged CSV.
+
+Run
+---
+    .venv/bin/python scripts/mas_monitor.py
+
+Dependencies
+------------
+    pip install matplotlib pandas pyserial
+"""
+
+from __future__ import annotations
+
+import csv
+import threading
+import time
+import datetime
+from collections import deque
+from pathlib import Path
+from tkinter import filedialog, messagebox
+
+import matplotlib
+matplotlib.use("TkAgg")
+
+import tkinter as tk
+from tkinter import ttk
+import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
+import numpy as np
+import pandas as pd
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+
+try:
+    import serial
+    import serial.tools.list_ports
+    HAS_SERIAL = True
+except ImportError:
+    HAS_SERIAL = False
+
+try:
+    from scipy.signal import savgol_filter
+    from scipy.ndimage import gaussian_filter1d
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+# ── Palette ────────────────────────────────────────────────────────────────
+BG        = "#191919"   # window / frame background
+BG_PANEL  = "#212121"   # toolbar / control strip
+BG_ENTRY  = "#272727"   # entry / well
+BG_PLOT   = "#1f1f1f"   # matplotlib axes background
+FG        = "#e4e4e4"   # primary text
+FG_DIM    = "#5a5a5a"   # secondary / placeholder
+BORDER    = "#303030"   # widget borders, spine colour
+SEP_COL   = "#2c2c2c"   # divider lines
+
+BTN_BG    = "#2b2b2b"   # button face
+BTN_HV    = "#3a3a3a"   # button hover / active
+LFR_BG    = "#1e1e1e"   # LabelFrame interior
+
+ACCENT    = "#4a9fe5"   # interactive blue
+GREEN     = "#3ecb6f"   # connected / OK
+AMBER     = "#e8a43a"   # warning
+RED       = "#e05c5c"   # error / caution
+PURPLE    = "#a97ee0"   # temperature
+
+# Data-series colours
+C_FREQ    = "#4a9fe5"   # spin frequency  (blue)
+C_PRESS   = "#e8a43a"   # pressure        (amber)
+C_FLOW    = "#3ecb6f"   # flow rate       (green)
+C_TEMP    = "#a97ee0"   # temperature     (purple)
+C_MEAN    = "#e05c5c"   # mean / reference (coral)
+
+FONT      = ("Helvetica Neue", 11)
+FONT_SM   = ("Helvetica Neue", 10)
+FONT_B    = ("Helvetica Neue", 11, "bold")
+
+# ── Constants ──────────────────────────────────────────────────────────────
+APP_TITLE      = "MAS Rotor Monitor"
+UNIT_MULTS     = {"Hz": 1.0, "kHz": 1e-3, "kRPM": 60e-3}
+FILTER_TYPES   = ["None", "Mean", "Median", "Savitzky-Golay", "Gaussian"]
+WINDOW_SIZES   = ["5", "10", "25", "50", "100", "200", "500"]
+DESPIKE_THRESH = ["1.5", "2.0", "2.5", "3.0", "4.0", "5.0"]
+REFRESH_SEC    = ["0.5", "1", "2", "5", "10"]
+WINDOW_OPTIONS = ["All", "30 s", "1 min", "5 min", "10 min", "30 min"]
+ALICAT_BAUD    = 19200
+ALICAT_BAUDS   = ["9600", "19200", "38400", "57600", "115200"]
+ALICAT_CSV_COLS = ["timestamp", "pressure_bar", "temperature_C",
+                   "vol_flow_slm", "mass_flow_slm", "setpoint", "gas"]
+
+import matplotlib as _mpl
+_mpl.rcParams.update({
+    "font.family":      "sans-serif",
+    "font.size":        8.5,
+    "axes.labelsize":   8.5,
+    "axes.titlesize":   9,
+    "xtick.labelsize":  7.5,
+    "ytick.labelsize":  7.5,
+    "legend.fontsize":  7,
+    "savefig.dpi":      300,
+    "savefig.bbox":     "tight",
+    "pdf.fonttype":     42,
+    "ps.fonttype":      42,
+})
+
+
+# ── Widget helpers ─────────────────────────────────────────────────────────
+
+def _group(parent, title, **kw):
+    return tk.LabelFrame(
+        parent, text=f"  {title}  ",
+        bg=LFR_BG, fg=FG_DIM, font=FONT_SM,
+        bd=1, relief="solid", **kw
+    )
+
+def _label(parent, text, dim=False, **kw):
+    return tk.Label(parent, text=text, bg=BG_PANEL,
+                    fg=FG_DIM if dim else FG, font=FONT, **kw)
+
+def _label2(parent, text, dim=False, **kw):
+    """Label on LFR_BG background."""
+    return tk.Label(parent, text=text, bg=LFR_BG,
+                    fg=FG_DIM if dim else FG, font=FONT, **kw)
+
+
+class _Btn(tk.Label):
+    """Dark-styled button using tk.Label so bg colour always renders on macOS.
+    tk.Button ignores explicit bg in macOS native Aqua mode; tk.Label does not.
+    """
+    def __init__(self, parent, text, command, width=None, bg=BTN_BG, **kw):
+        super().__init__(
+            parent, text=text,
+            bg=bg, fg=FG, font=FONT,
+            padx=10, pady=4,
+            relief="flat", bd=0,
+            cursor="hand2",
+            anchor="center",
+            **kw
+        )
+        if width:
+            self.configure(width=width)
+        self._cmd      = command
+        self._bg       = bg
+        self._enabled  = True
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>",    self._on_enter)
+        self.bind("<Leave>",    self._on_leave)
+
+    def _on_click(self, _e):
+        if self._enabled and self._cmd:
+            self._cmd()
+
+    def _on_enter(self, _e):
+        if self._enabled:
+            super().configure(bg=BTN_HV)
+
+    def _on_leave(self, _e):
+        super().configure(bg=self._bg)
+
+    def configure(self, **kw):
+        state = kw.pop("state", None)
+        if state == "disabled":
+            self._enabled = False
+            super().configure(fg=FG_DIM, cursor="arrow")
+        elif state in ("normal", "active"):
+            self._enabled = True
+            super().configure(fg=FG, cursor="hand2")
+        if kw:
+            super().configure(**kw)
+
+    config = configure  # alias
+
+
+def _btn(parent, text, command, width=None, **kw):
+    return _Btn(parent, text, command, width=width, **kw)
+
+
+def _combo(parent, var, values, width=8, **kw):
+    return ttk.Combobox(parent, textvariable=var, values=values,
+                        width=width, state="readonly", font=FONT, **kw)
+
+def _entry(parent, var=None, width=18, **kw):
+    e = tk.Entry(parent, bg=BG_ENTRY, fg=FG, font=FONT,
+                 relief="flat", bd=1, width=width,
+                 insertbackground=FG,
+                 highlightbackground=BORDER, highlightthickness=1,
+                 **kw)
+    if var is not None:
+        e.configure(textvariable=var)
+    return e
+
+def _sep_v(parent, pad=6):
+    f = tk.Frame(parent, bg=BORDER, width=1)
+    f.pack(side="left", fill="y", padx=pad)
+    return f
+
+
+# ── Axes styling ───────────────────────────────────────────────────────────
+
+def _style_ax(ax, grid=True):
+    ax.set_facecolor(BG_PLOT)
+    ax.tick_params(colors=FG, labelcolor=FG, which="both", length=3)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(BORDER)
+        sp.set_linewidth(0.8)
+    ax.xaxis.label.set_color(FG)
+    ax.yaxis.label.set_color(FG)
+    ax.title.set_color(FG)
+    if grid:
+        ax.grid(True, lw=0.35, alpha=0.45, color=BORDER)
+        ax.set_axisbelow(True)
+
+
+# ── PicoScope CSV parser ───────────────────────────────────────────────────
+
+def load_picoscope_csv(path: str | Path) -> pd.DataFrame:
+    rows: list[tuple] = []
+    with open(path, encoding="utf-8-sig", errors="replace") as fh:
+        reader = csv.reader(fh, delimiter=";")
+        next(reader, None)
+        for row in reader:
+            if len(row) < 2:
+                continue
+            try:
+                ts   = datetime.datetime.strptime(row[0].strip(), "%Y-%m-%d %H:%M:%S")
+                freq = float(row[1].strip().replace(",", "."))
+                rows.append((ts, freq))
+            except (ValueError, IndexError):
+                continue
+
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "frequency_hz", "elapsed_s"])
+
+    df = pd.DataFrame(rows, columns=["timestamp", "frequency_hz"])
+
+    # Spread rows within each second evenly for a smooth time axis
+    sub_s   = np.zeros(len(df))
+    gs, prev_ts = 0, None
+    for i, ts in enumerate(df["timestamp"]):
+        if ts != prev_ts:
+            if prev_ts is not None:
+                n = i - gs
+                sub_s[gs:i] = np.linspace(0, 1 - 1 / n, n)
+            gs, prev_ts = i, ts
+    n = len(df) - gs
+    if n > 0:
+        sub_s[gs:] = np.linspace(0, 1 - 1 / n, n)
+
+    df["timestamp"] = (pd.to_datetime(df["timestamp"])
+                       + pd.to_timedelta(sub_s, unit="s"))
+    df["elapsed_s"] = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds()
+    return df
+
+
+# ── Alicat CSV file loader ─────────────────────────────────────────────────
+
+def load_alicat_csv(path: str | Path) -> pd.DataFrame:
+    """Load a previously-saved Alicat log CSV and normalise column names to
+    match the live-polling format used internally (pressure, temperature,
+    vol_flow, mass_flow, setpoint, gas)."""
+    df = pd.read_csv(path, encoding="utf-8-sig", on_bad_lines="skip")
+    # Rename saved-log column names → internal names
+    rename = {
+        "pressure_bar":    "pressure",
+        "temperature_C":   "temperature",
+        "vol_flow_slm":    "vol_flow",
+        "mass_flow_slm":   "mass_flow",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    if "timestamp" not in df.columns:
+        raise ValueError("CSV does not contain a 'timestamp' column.")
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    for col in ("pressure", "temperature", "vol_flow", "mass_flow"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+# ── Alicat serial logger ───────────────────────────────────────────────────
+
+class AlicatLogger:
+    def __init__(self, port: str, address: str = "A", poll_hz: float = 2.0):
+        self.port    = port
+        self.address = address.upper()
+        self.poll_hz = poll_hz
+        self._conn: "serial.Serial | None" = None
+        self._thread: threading.Thread | None = None
+        self._stop   = threading.Event()
+        self._lock   = threading.Lock()
+        self._data: deque[dict] = deque(maxlen=100_000)
+        self.last_reading: dict | None = None
+        self.last_raw:     str  = ""
+        self.error:        str | None = None
+        self._raw_log: deque[str] = deque(maxlen=200)   # rolling raw-line history
+        # CSV file logging
+        self._csv_fh     = None
+        self._csv_writer = None
+        self._csv_rows   = 0
+        # Thread-safe command queue (setpoint / gas changes)
+        self._cmd_lock    = threading.Lock()
+        self._pending_cmd: str | None = None
+
+    def connect(self, baud: int = ALICAT_BAUD) -> None:
+        if not HAS_SERIAL:
+            raise RuntimeError("pyserial not installed — run: pip install pyserial")
+        self._conn = serial.Serial(
+            self.port,
+            baudrate=baud,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=1.0,        # generous read timeout
+            write_timeout=1.0,
+            rtscts=False,
+            dsrdtr=False,
+            xonxoff=False,
+        )
+        time.sleep(0.1)                    # let adapter settle after open
+        self._conn.reset_input_buffer()    # discard any stale bytes
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def disconnect(self) -> None:
+        self.stop_csv_log()
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        if self._conn and self._conn.is_open:
+            self._conn.close()
+        self._conn = None
+
+    def start_csv_log(self, path: str | Path) -> None:
+        """Open *path* for writing and begin appending every poll reading."""
+        self.stop_csv_log()             # close any previous file
+        self._csv_fh = open(path, "w", newline="", encoding="utf-8")
+        self._csv_writer = csv.writer(self._csv_fh)
+        self._csv_writer.writerow(ALICAT_CSV_COLS)   # header
+        self._csv_fh.flush()
+        self._csv_rows = 0
+
+    def stop_csv_log(self) -> None:
+        """Flush and close the Alicat CSV log file (no-op if not open)."""
+        if self._csv_fh is not None:
+            try:
+                self._csv_fh.flush()
+                self._csv_fh.close()
+            except Exception:
+                pass
+            self._csv_fh     = None
+            self._csv_writer = None
+
+    @property
+    def csv_rows_written(self) -> int:
+        return self._csv_rows
+
+    @property
+    def is_connected(self) -> bool:
+        return self._conn is not None and self._conn.is_open
+
+    def set_setpoint(self, value: float) -> None:
+        """Queue a setpoint change (sent before the next poll cycle)."""
+        if not self.is_connected:
+            raise RuntimeError("Not connected to Alicat.")
+        with self._cmd_lock:
+            # Alicat protocol: <address><value>\r  e.g. "A0.500\r"
+            self._pending_cmd = f"{self.address}{value:.4f}\r"
+
+    def set_gas(self, gas_id: int) -> None:
+        """Queue a gas-type change by integer ID (0=Air, 1=Ar, 2=CO₂, …)."""
+        if not self.is_connected:
+            raise RuntimeError("Not connected to Alicat.")
+        with self._cmd_lock:
+            self._pending_cmd = f"{self.address}$$G{gas_id:d}\r"
+
+    def get_dataframe(self) -> pd.DataFrame:
+        with self._lock:
+            rows = list(self._data)
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    def _loop(self) -> None:
+        interval = 1.0 / self.poll_hz
+        while not self._stop.is_set():
+            try:
+                # Send any queued command (setpoint / gas change) first
+                with self._cmd_lock:
+                    cmd = self._pending_cmd
+                    self._pending_cmd = None
+                if cmd:
+                    self._conn.write(cmd.encode())
+                    self._conn.readline()   # discard echo / ack
+
+                r = self._poll()
+                if r:
+                    with self._lock:
+                        self._data.append(r)
+                    self.last_reading = r
+                    self.error = None
+                    # Write to CSV if logging is active
+                    if self._csv_writer is not None:
+                        self._csv_writer.writerow([
+                            r.get("timestamp", ""),
+                            r.get("pressure", ""),
+                            r.get("temperature", ""),
+                            r.get("vol_flow", ""),
+                            r.get("mass_flow", ""),
+                            r.get("setpoint", ""),
+                            r.get("gas", ""),
+                        ])
+                        self._csv_fh.flush()
+                        self._csv_rows += 1
+            except Exception as exc:
+                self.error = str(exc)
+            time.sleep(interval)
+
+    def _poll(self) -> dict | None:
+        self._conn.reset_input_buffer()
+
+        # Toggle RTS high before write — many USB-RS485 adapters use RTS to
+        # switch the DE (Driver Enable) line on the half-duplex transceiver.
+        self._conn.rts = True
+        self._conn.write((self.address + "\r").encode())
+        self._conn.flush()
+        # Hold RTS long enough for the last stop-bit to finish transmitting
+        # at 19200 baud one char ≈ 0.52 ms; 2 chars + margin = 10 ms
+        time.sleep(0.01)
+        self._conn.rts = False                    # switch adapter to receive mode
+        time.sleep(0.05)                          # DE→RE turnaround settle
+
+        # Alicat responses are terminated with \r, NOT \r\n.
+        # readline() waits for \n and would time out — use read_until instead.
+        raw_bytes = self._conn.read_until(b"\r")
+        raw = raw_bytes.decode("ascii", errors="replace").strip()
+        # Store hex preview for diagnostics so null/garbage bytes are visible
+        hex_preview = raw_bytes[:16].hex(" ") if raw_bytes else ""
+        self.last_raw = raw if raw else f"(hex: {hex_preview})"
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        rx_repr = repr(raw) if raw else repr(hex_preview)
+        self._raw_log.append(
+            f"{ts}  TX: {self.address!r}\\r   RX({len(raw_bytes)}B): {rx_repr}"
+        )
+        if not raw:
+            return None
+        parts = raw.split()
+        # Need at least address + one numeric field; be lenient about response length
+        if len(parts) < 2:
+            return None
+        reading: dict = {"timestamp": datetime.datetime.now(), "address": parts[0]}
+        # Standard Alicat streaming response (7 fields after address):
+        #   <addr> <pressure> <temp> <vol_flow> <mass_flow> <setpoint> <gas>
+        # Map whatever fields are present; extras are silently ignored.
+        for label, val in zip(
+            ["pressure", "temperature", "vol_flow", "mass_flow", "setpoint", "gas"],
+            parts[1:]
+        ):
+            try:
+                reading[label] = float(val)
+            except ValueError:
+                reading[label] = val
+        # Accept only if we got at least one numeric value (pressure or mass_flow)
+        if "pressure" not in reading and "mass_flow" not in reading:
+            return None
+        return reading
+
+
+# ── Main application ───────────────────────────────────────────────────────
+
+class MASMonitor(tk.Tk):
+
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.configure(bg=BG)
+        self.geometry("1240x760")
+        self.minsize(900, 600)
+
+        self._csv_path: Path | None = None
+        self._df       = pd.DataFrame()
+        self._alicat   = AlicatLogger("")
+        self._alicat_logging  = False
+        self._alicat_csv_path: Path | None = None
+        self._alicat_file_df:  pd.DataFrame = pd.DataFrame()
+        self._alicat_file_path: Path | None = None
+        self._refresh_job: str | None = None
+        self._live_redraw_job: str | None = None
+
+        # Spin routine state
+        # Each step: (setpoint_value, duration_seconds)
+        self._spinup_steps:   list[tuple[float, float]] = []
+        self._spindown_steps: list[tuple[float, float]] = []
+        self._routine_thread: threading.Thread | None = None
+        self._routine_stop   = threading.Event()
+        self._routine_pause  = threading.Event()
+        self._routine_status = ""   # written by thread, read by UI tick
+
+        # ttk style overrides for comboboxes — keep default Aqua theme so that
+        # tk.Button respects explicit bg colours; only restyle TCombobox fields.
+        st = ttk.Style(self)
+        st.configure("TCombobox",
+                      fieldbackground=BG_ENTRY,
+                      background=BTN_BG,
+                      foreground=FG,
+                      selectbackground=ACCENT,
+                      selectforeground=FG,
+                      bordercolor=BORDER,
+                      arrowcolor=FG_DIM)
+        # Make the drop-down list background dark
+        self.option_add("*TCombobox*Listbox.background", BG_ENTRY)
+        self.option_add("*TCombobox*Listbox.foreground", FG)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.option_add("*TCombobox*Listbox.selectForeground", FG)
+
+        self._build_ui()
+        self._poll_alicat_status()
+
+    # ── UI construction ────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self._build_top_bar()   # row 0
+        self._build_plot()      # row 1 — expands
+        self._build_controls()  # row 2
+        self._build_status()    # row 3
+        self.rowconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
+
+    # -- top bar -----------------------------------------------------------
+
+    def _build_top_bar(self):
+        bar = tk.Frame(self, bg=BG_PANEL, pady=6, padx=10)
+        bar.grid(row=0, column=0, sticky="ew")
+
+        _label(bar, "CSV file:").pack(side="left")
+
+        self._file_lbl = tk.Label(
+            bar, text="  no file loaded  ",
+            bg=BG_ENTRY, fg=FG_DIM, font=FONT,
+            relief="flat", bd=0, padx=6, pady=2,
+            anchor="w", width=38,
+            highlightbackground=BORDER, highlightthickness=1,
+        )
+        self._file_lbl.pack(side="left", padx=(5, 10))
+
+        _btn(bar, "Open…", self._open_csv).pack(side="left")
+
+        _sep_v(bar, 12)
+
+        _label(bar, "Auto-refresh:").pack(side="left")
+        self._refresh_var = tk.StringVar(value="2")
+        _combo(bar, self._refresh_var, REFRESH_SEC, width=4).pack(side="left", padx=(5, 3))
+        _label(bar, "s").pack(side="left", padx=(0, 8))
+
+        self._auto_var = tk.BooleanVar(value=False)
+        self._auto_chk = tk.Checkbutton(
+            bar, text="Auto", variable=self._auto_var,
+            bg=BG_PANEL, fg=FG, font=FONT,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            activeforeground=FG,
+            command=self._toggle_auto,
+        )
+        self._auto_chk.pack(side="left", padx=(0, 8))
+
+        _btn(bar, "Refresh", self._reload).pack(side="left")
+
+    # -- plot --------------------------------------------------------------
+
+    def _build_plot(self):
+        pf = tk.Frame(self, bg=BG, padx=4, pady=3)
+        pf.grid(row=1, column=0, sticky="nsew")
+        pf.rowconfigure(0, weight=1)
+        pf.columnconfigure(0, weight=1)
+
+        self._fig = Figure(facecolor=BG, tight_layout=False)
+        self._canvas = FigureCanvasTkAgg(self._fig, master=pf)
+        self._canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        tb_frame = tk.Frame(pf, bg=BG_PANEL)
+        tb_frame.grid(row=1, column=0, sticky="ew")
+        NavigationToolbar2Tk(self._canvas, tb_frame)
+
+    # -- controls strip ----------------------------------------------------
+
+    def _build_controls(self):
+        strip = tk.Frame(self, bg=BG_PANEL, padx=8, pady=6)
+        strip.grid(row=2, column=0, sticky="ew")
+
+        # ── Display ──
+        dg = _group(strip, "Display")
+        dg.pack(side="left", padx=(0, 10), fill="y", pady=2)
+
+        r = tk.Frame(dg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(6, 2))
+        _label2(r, "Unit:").pack(side="left")
+        self._unit_var = tk.StringVar(value="kHz")
+        uc = _combo(r, self._unit_var, list(UNIT_MULTS), width=6)
+        uc.pack(side="left", padx=(6, 0))
+        uc.bind("<<ComboboxSelected>>", lambda _: self._redraw())
+
+        r = tk.Frame(dg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=2)
+        _label2(r, "Filter:").pack(side="left")
+        self._filter_var = tk.StringVar(value="None")
+        ft = _combo(r, self._filter_var, FILTER_TYPES, width=13)
+        ft.pack(side="left", padx=(6, 6))
+        ft.bind("<<ComboboxSelected>>", lambda _: self._redraw())
+        _label2(r, "N:").pack(side="left")
+        self._fwin_var = tk.StringVar(value="25")
+        fw = _combo(r, self._fwin_var, WINDOW_SIZES, width=4)
+        fw.pack(side="left", padx=(4, 0))
+        fw.bind("<<ComboboxSelected>>", lambda _: self._redraw())
+
+        r = tk.Frame(dg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=2)
+        self._despike_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            r, text="Despike", variable=self._despike_var,
+            bg=LFR_BG, fg=FG, font=FONT,
+            selectcolor=BG_ENTRY, activebackground=LFR_BG, activeforeground=FG,
+            command=self._redraw,
+        ).pack(side="left")
+        _label2(r, "  thresh:").pack(side="left")
+        self._despike_thresh_var = tk.StringVar(value="3.0")
+        dt = _combo(r, self._despike_thresh_var, DESPIKE_THRESH, width=4)
+        dt.pack(side="left", padx=(4, 0))
+        dt.bind("<<ComboboxSelected>>", lambda _: self._redraw())
+        _label2(r, "σ").pack(side="left", padx=(3, 0))
+
+        r = tk.Frame(dg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=2)
+        self._show_mean_var = tk.BooleanVar(value=True)
+        self._show_sigma_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            r, text="Mean line", variable=self._show_mean_var,
+            bg=LFR_BG, fg=FG, font=FONT,
+            selectcolor=BG_ENTRY, activebackground=LFR_BG, activeforeground=FG,
+            command=self._redraw,
+        ).pack(side="left", padx=(0, 10))
+        tk.Checkbutton(
+            r, text="±1σ band", variable=self._show_sigma_var,
+            bg=LFR_BG, fg=FG, font=FONT,
+            selectcolor=BG_ENTRY, activebackground=LFR_BG, activeforeground=FG,
+            command=self._redraw,
+        ).pack(side="left")
+
+        r = tk.Frame(dg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(2, 8))
+        _label2(r, "Show last:").pack(side="left")
+        self._window_var = tk.StringVar(value="All")
+        wc = _combo(r, self._window_var, WINDOW_OPTIONS, width=7)
+        wc.pack(side="left", padx=(6, 0))
+        wc.bind("<<ComboboxSelected>>", lambda _: self._redraw())
+
+        # ── Alicat ──
+        ag = _group(strip, "Alicat flow / pressure meter")
+        ag.pack(side="left", padx=(0, 10), fill="y", pady=2)
+
+        if not HAS_SERIAL:
+            tk.Label(ag, text="pip install pyserial to enable",
+                     bg=LFR_BG, fg=FG_DIM, font=FONT_SM).pack(padx=10, pady=10)
+        else:
+            r0 = tk.Frame(ag, bg=LFR_BG); r0.pack(fill="x", padx=8, pady=(6, 2))
+            _label2(r0, "Port:").pack(side="left")
+            self._port_var = tk.StringVar()
+            self._port_cb  = _combo(r0, self._port_var, [], width=16)
+            self._port_cb.pack(side="left", padx=(6, 4))
+            _btn(r0, "⟳", self._scan_ports, width=2).pack(side="left")
+            _label2(r0, "  Baud:").pack(side="left")
+            self._baud_var = tk.StringVar(value="9600")
+            _combo(r0, self._baud_var, ALICAT_BAUDS, width=7).pack(side="left", padx=(4, 6))
+            _label2(r0, "Addr:").pack(side="left")
+            self._addr_var = tk.StringVar(value="A")
+            _entry(r0, self._addr_var, width=3).pack(side="left", padx=(4, 0))
+
+            # Load historical Alicat CSV
+            r_load = tk.Frame(ag, bg=LFR_BG); r_load.pack(fill="x", padx=8, pady=(0, 2))
+            _label2(r_load, "Load file:").pack(side="left")
+            self._alicat_file_lbl = tk.Label(
+                r_load, text="  no file loaded  ",
+                bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
+                relief="flat", bd=0, padx=4, pady=1, anchor="w", width=24,
+                highlightbackground=BORDER, highlightthickness=1,
+            )
+            self._alicat_file_lbl.pack(side="left", padx=(4, 4))
+            _btn(r_load, "Open…", self._open_alicat_file).pack(side="left", padx=(0, 4))
+            _btn(r_load, "✕", self._clear_alicat_file, width=2).pack(side="left")
+
+            # CSV log file path
+            r_csv = tk.Frame(ag, bg=LFR_BG); r_csv.pack(fill="x", padx=8, pady=(0, 2))
+            _label2(r_csv, "Log CSV:").pack(side="left")
+            self._alicat_csv_lbl = tk.Label(
+                r_csv, text="  not set  ",
+                bg=BG_ENTRY, fg=FG_DIM, font=FONT_SM,
+                relief="flat", bd=0, padx=4, pady=1, anchor="w", width=24,
+                highlightbackground=BORDER, highlightthickness=1,
+            )
+            self._alicat_csv_lbl.pack(side="left", padx=(4, 4))
+            _btn(r_csv, "Browse…", self._browse_alicat_csv).pack(side="left")
+
+            r1 = tk.Frame(ag, bg=LFR_BG); r1.pack(fill="x", padx=8, pady=(2, 2))
+            self._conn_btn = _btn(r1, "Connect", self._toggle_alicat_conn)
+            self._conn_btn.pack(side="left", padx=(0, 8))
+            self._log_btn  = _btn(r1, "▶  Start logging", self._toggle_alicat_log)
+            self._log_btn.configure(state="disabled")
+            self._log_btn.pack(side="left", padx=(0, 8))
+            _btn(r1, "Serial monitor…", self._open_serial_monitor).pack(side="left")
+
+            self._alicat_lbl = tk.Label(
+                ag, text="Not connected",
+                bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w"
+            )
+            self._alicat_lbl.pack(fill="x", padx=8, pady=(2, 8))
+            self._scan_ports()
+
+        # ── Pressure Control ──
+        cg = _group(strip, "Pressure control")
+        cg.pack(side="left", padx=(0, 10), fill="y", pady=2)
+
+        # Live readout tiles (2 × 2 grid)
+        ro = tk.Frame(cg, bg=LFR_BG); ro.pack(fill="x", padx=8, pady=(6, 2))
+
+        def _tile(parent, title, col):
+            f = tk.Frame(parent, bg=BG_ENTRY, bd=0,
+                         highlightbackground=BORDER, highlightthickness=1)
+            f.grid_columnconfigure(0, weight=1)
+            tk.Label(f, text=title, bg=BG_ENTRY, fg=FG_DIM,
+                     font=FONT_SM, anchor="w").pack(fill="x", padx=5, pady=(3, 0))
+            val_lbl = tk.Label(f, text="–", bg=BG_ENTRY, fg=col,
+                               font=("Helvetica Neue", 13, "bold"), anchor="w")
+            val_lbl.pack(fill="x", padx=5, pady=(0, 4))
+            return f, val_lbl
+
+        f_p,  self._ctl_p_lbl  = _tile(ro, "Pressure",  C_PRESS)
+        f_t,  self._ctl_t_lbl  = _tile(ro, "Temp",      C_TEMP)
+        f_q,  self._ctl_q_lbl  = _tile(ro, "Mass flow", C_FLOW)
+        f_sp, self._ctl_sp_lbl = _tile(ro, "Setpoint",  FG)
+        for col, tile in enumerate([f_p, f_t, f_q, f_sp]):
+            tile.grid(row=0, column=col, padx=(0, 4) if col < 3 else 0, pady=0, sticky="ew")
+            ro.columnconfigure(col, weight=1)
+
+        # Units labels (small, below tiles)
+        ru = tk.Frame(cg, bg=LFR_BG); ru.pack(fill="x", padx=8, pady=(0, 2))
+        for col, txt in enumerate(["bar", "°C", "slm", "slm"]):
+            tk.Label(ru, text=txt, bg=LFR_BG, fg=FG_DIM, font=("Helvetica Neue", 9),
+                     anchor="center").grid(row=0, column=col, sticky="ew", padx=(0, 4) if col < 3 else 0)
+            ru.columnconfigure(col, weight=1)
+
+        # Setpoint control row
+        rs = tk.Frame(cg, bg=LFR_BG); rs.pack(fill="x", padx=8, pady=(4, 2))
+        _label2(rs, "Set SP:").pack(side="left")
+        self._sp_entry_var = tk.StringVar(value="0.0000")
+        sp_entry = _entry(rs, self._sp_entry_var, width=9)
+        sp_entry.pack(side="left", padx=(6, 6))
+        sp_entry.bind("<Return>", lambda _: self._send_setpoint())
+        _btn(rs, "Send", self._send_setpoint).pack(side="left", padx=(0, 8))
+        _label2(rs, "Gas:").pack(side="left")
+        self._gas_var = tk.StringVar(value="Air")
+        ALICAT_GASES = ["Air", "Ar", "CH₄", "CO", "CO₂", "C₂H₆", "H₂", "He", "N₂"]
+        self._gas_cb = _combo(rs, self._gas_var, ALICAT_GASES, width=6)
+        self._gas_cb.pack(side="left", padx=(4, 0))
+        self._gas_cb.bind("<<ComboboxSelected>>", lambda _: self._send_gas())
+
+        self._ctl_status_lbl = tk.Label(
+            cg, text="Not connected", bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
+        self._ctl_status_lbl.pack(fill="x", padx=8, pady=(2, 8))
+
+        # ── Spin routine ──
+        rg = _group(strip, "Spin routine")
+        rg.pack(side="left", padx=(0, 10), fill="y", pady=2)
+
+        rb = tk.Frame(rg, bg=LFR_BG); rb.pack(fill="x", padx=8, pady=(6, 4))
+        _btn(rb, "↑ Spin up",   self._start_spinup,   bg="#1e3d1e").pack(side="left", padx=(0, 6))
+        _btn(rb, "↓ Spin down", self._start_spindown,  bg="#1e2a3d").pack(side="left", padx=(0, 6))
+        self._pause_btn = _btn(rb, "⏸ Pause", self._pause_routine, bg=BTN_BG)
+        self._pause_btn.pack(side="left", padx=(0, 6))
+        _btn(rb, "⏹ Stop", self._stop_routine, bg="#3d1e1e").pack(side="left")
+
+        rb2 = tk.Frame(rg, bg=LFR_BG); rb2.pack(fill="x", padx=8, pady=(0, 2))
+        _btn(rb2, "Edit routines…", self._open_routine_editor).pack(side="left")
+
+        self._routine_lbl = tk.Label(
+            rg, text="No routine running", bg=LFR_BG, fg=FG_DIM,
+            font=FONT_SM, anchor="w")
+        self._routine_lbl.pack(fill="x", padx=8, pady=(2, 8))
+
+        # ── Export ──
+        eg = _group(strip, "Export")
+        eg.pack(side="left", fill="y", pady=2)
+
+        r = tk.Frame(eg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(6, 2))
+        _label2(r, "From:").pack(side="left")
+        self._t_from = _entry(r, width=18); self._t_from.pack(side="left", padx=(6, 10))
+        _label2(r, "To:").pack(side="left")
+        self._t_to   = _entry(r, width=18); self._t_to.pack(side="left", padx=(6, 10))
+        _btn(r, "Use visible", self._use_visible_range).pack(side="left")
+
+        r = tk.Frame(eg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(2, 8))
+        _btn(r, "Save plot (PDF)", lambda: self._export_plot("pdf")).pack(side="left", padx=(0, 6))
+        _btn(r, "Save plot (PNG)", lambda: self._export_plot("png")).pack(side="left", padx=(0, 6))
+        _btn(r, "Save data (CSV)", self._export_csv).pack(side="left")
+
+    # -- status bar --------------------------------------------------------
+
+    def _build_status(self):
+        self._status_var = tk.StringVar(value="Ready — open a PicoScope CSV file to begin.")
+        bar = tk.Label(self, textvariable=self._status_var,
+                       bg=BG_PANEL, fg=FG_DIM, font=FONT_SM,
+                       anchor="w", padx=10, pady=4,
+                       relief="flat")
+        bar.grid(row=3, column=0, sticky="ew")
+
+    # ── File loading ───────────────────────────────────────────────────────
+
+    def _open_csv(self):
+        path = filedialog.askopenfilename(
+            title="Select PicoScope frequency log CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if path:
+            self._csv_path = Path(path)
+            self._file_lbl.configure(text=f"  {self._csv_path.name}  ", fg=FG)
+            self._reload()
+
+    def _reload(self):
+        if self._csv_path is None:
+            return
+        try:
+            self._df = load_picoscope_csv(self._csv_path)
+            n    = len(self._df)
+            span = self._df["elapsed_s"].iloc[-1] if n else 0.0
+            t0   = self._df["timestamp"].iloc[0].strftime("%H:%M:%S") if n else "–"
+            t1   = self._df["timestamp"].iloc[-1].strftime("%H:%M:%S") if n else "–"
+            self._status(f"Loaded {n:,} rows  ·  {span:.1f} s  ·  {t0} – {t1}")
+            self._redraw()
+        except Exception as exc:
+            messagebox.showerror("Load error", str(exc))
+
+    def _toggle_auto(self):
+        if self._auto_var.get():
+            self._schedule_refresh()
+        else:
+            if self._refresh_job:
+                self.after_cancel(self._refresh_job)
+                self._refresh_job = None
+
+    def _schedule_refresh(self):
+        if not self._auto_var.get():
+            return
+        self._reload()
+        try:
+            ms = int(float(self._refresh_var.get()) * 1000)
+        except ValueError:
+            ms = 2000
+        self._refresh_job = self.after(ms, self._schedule_refresh)
+
+    # ── Drawing ────────────────────────────────────────────────────────────
+
+    def _get_spin_df(self) -> pd.DataFrame:
+        df = self._df.copy()
+        if df.empty:
+            return df
+
+        # ── Time window ──────────────────────────────────────────────────────
+        win = self._window_var.get()
+        if win != "All":
+            secs = {"30 s": 30, "1 min": 60, "5 min": 300,
+                    "10 min": 600, "30 min": 1800}.get(win, None)
+            if secs:
+                df = df[df["elapsed_s"] >= df["elapsed_s"].iloc[-1] - secs].copy()
+
+        f = df["frequency_hz"].values.copy()
+
+        # ── Despiking ────────────────────────────────────────────────────────
+        if self._despike_var.get():
+            try:
+                thresh = float(self._despike_thresh_var.get())
+                median = np.median(f)
+                mad    = np.median(np.abs(f - median)) * 1.4826  # ≈ σ for Gaussian
+                if mad > 0:
+                    mask   = np.abs(f - median) > thresh * mad
+                    f[mask] = np.nan
+                    # Linear interpolation over NaN gaps
+                    nans = np.isnan(f)
+                    if nans.any() and (~nans).any():
+                        xs = np.arange(len(f))
+                        f  = np.interp(xs, xs[~nans], f[~nans])
+            except Exception:
+                pass
+
+        # ── Smoothing filter ─────────────────────────────────────────────────
+        ftype = self._filter_var.get()
+        try:
+            n = int(self._fwin_var.get())
+        except ValueError:
+            n = 25
+
+        if ftype == "Mean" and n > 1:
+            f = pd.Series(f).rolling(n, min_periods=1, center=True).mean().values
+
+        elif ftype == "Median" and n > 1:
+            f = pd.Series(f).rolling(n, min_periods=1, center=True).median().values
+
+        elif ftype == "Savitzky-Golay" and n > 3:
+            if HAS_SCIPY:
+                # polyorder must be < window; use 3 or n-1 whichever is smaller
+                poly = min(3, n - 1)
+                wlen = n if n % 2 == 1 else n + 1   # must be odd
+                try:
+                    f = savgol_filter(f, window_length=wlen, polyorder=poly)
+                except Exception:
+                    pass
+            else:
+                # fallback: rolling mean
+                f = pd.Series(f).rolling(n, min_periods=1, center=True).mean().values
+
+        elif ftype == "Gaussian" and n > 1:
+            if HAS_SCIPY:
+                sigma = n / 6.0   # n ≈ ±3σ full width
+                f = gaussian_filter1d(f, sigma=sigma)
+            else:
+                f = pd.Series(f).rolling(n, min_periods=1, center=True).mean().values
+
+        df = df.copy()
+        df["frequency_hz"] = f
+        return df
+
+    def _merge_for_scatter(self, spin_df: pd.DataFrame, adf: pd.DataFrame) -> pd.DataFrame:
+        """Merge Alicat readings onto spin timestamps (nearest, ≤ 2 s tolerance)."""
+        if adf.empty or spin_df.empty:
+            return pd.DataFrame()
+        adf = adf.copy()
+        adf["timestamp"] = pd.to_datetime(adf["timestamp"])
+        cols = ["timestamp"] + [c for c in ("pressure", "temperature", "vol_flow", "mass_flow")
+                                 if c in adf.columns]
+        merged = pd.merge_asof(
+            spin_df.sort_values("timestamp"),
+            adf[cols].sort_values("timestamp"),
+            on="timestamp", direction="nearest",
+            tolerance=pd.Timedelta("2s"),
+        )
+        return merged
+
+    def _redraw(self):
+        unit = self._unit_var.get()
+        mult = UNIT_MULTS[unit]
+        spin = self._get_spin_df()
+        adf  = self._get_alicat_df()
+        has_alic = not adf.empty
+
+        self._fig.clear()
+        self._fig.patch.set_facecolor(BG)
+
+        if spin.empty and not has_alic:
+            ax = self._fig.add_subplot(111)
+            _style_ax(ax, grid=False)
+            ax.text(0.5, 0.5,
+                    "Open a PicoScope CSV  or  connect the Alicat to begin",
+                    ha="center", va="center", color=FG_DIM,
+                    transform=ax.transAxes, fontsize=10)
+            ax.set_xticks([]); ax.set_yticks([])
+            self._canvas.draw_idle()
+            return
+
+        if has_alic and not spin.empty:
+            # ── Full layout: 2 time-series left + 2 scatter right ──
+            gs = self._fig.add_gridspec(
+                2, 2,
+                width_ratios=[3, 1.8],
+                height_ratios=[1.6, 1],
+                hspace=0.06, wspace=0.38,
+                left=0.07, right=0.97, top=0.93, bottom=0.10,
+            )
+            ax_freq = self._fig.add_subplot(gs[0, 0])
+            ax_gas  = self._fig.add_subplot(gs[1, 0], sharex=ax_freq)
+            ax_sc1  = self._fig.add_subplot(gs[0, 1])
+            ax_sc2  = self._fig.add_subplot(gs[1, 1])
+
+            self._draw_freq(ax_freq, spin, unit, mult, xlabel=False)
+            self._draw_gas(ax_gas, adf)
+            merged = self._merge_for_scatter(spin, adf)
+            self._draw_scatter(ax_sc1, merged, unit, mult, "pressure", C_PRESS, "Pressure")
+            self._draw_scatter(ax_sc2, merged, unit, mult, "mass_flow", C_FLOW, "Mass flow")
+
+        elif not spin.empty:
+            # ── Spin only ──
+            gs = self._fig.add_gridspec(1, 1, left=0.08, right=0.97, top=0.92, bottom=0.10)
+            ax_freq = self._fig.add_subplot(gs[0, 0])
+            self._draw_freq(ax_freq, spin, unit, mult, xlabel=True)
+
+        else:
+            # ── Alicat only (no spin file) ──
+            gs = self._fig.add_gridspec(1, 1, left=0.08, right=0.97, top=0.92, bottom=0.10)
+            ax_gas = self._fig.add_subplot(gs[0, 0])
+            self._draw_gas(ax_gas, adf)
+
+        self._canvas.draw_idle()
+
+    # -- individual panel renderers ----------------------------------------
+
+    def _draw_freq(self, ax, spin: pd.DataFrame, unit: str, mult: float, xlabel: bool):
+        _style_ax(ax)
+        t = spin["timestamp"]
+        f = spin["frequency_hz"] * mult
+        mean_f, std_f = float(f.mean()), float(f.std())
+
+        if self._show_sigma_var.get():
+            ax.fill_between(t, mean_f - std_f, mean_f + std_f,
+                            alpha=0.12, color=C_MEAN, zorder=1,
+                            label=f"±1σ  {std_f:.4f} {unit}")
+        ftype = self._filter_var.get()
+        fwin  = self._fwin_var.get()
+        flbl  = f"Spin freq ({ftype} N={fwin})" if ftype != "None" else "Spin frequency"
+        if self._despike_var.get():
+            flbl += f"  [despiked {self._despike_thresh_var.get()}σ]"
+        ax.plot(t, f, lw=0.85, color=C_FREQ, zorder=2, label=flbl)
+        if self._show_mean_var.get():
+            ax.axhline(mean_f, ls="--", lw=0.9, color=C_MEAN, alpha=0.85, zorder=3,
+                       label=f"Mean  {mean_f:.4f} {unit}")
+
+        ax.set_ylabel(f"Frequency ({unit})", color=FG)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        _auto_rotate_xlabels(ax)
+        if not xlabel:
+            ax.set_xticklabels([])
+            ax.set_xlabel("")
+        else:
+            ax.set_xlabel("Time")
+
+        # Stats annotation
+        ax.text(0.01, 0.97,
+                f"mean {mean_f:.4f} {unit}   σ {std_f:.4f} {unit}   σ/f {std_f/mean_f:.2e}",
+                transform=ax.transAxes, fontsize=6.5, va="top", ha="left", color=FG_DIM)
+
+        leg = ax.legend(loc="upper right", framealpha=0.25,
+                        facecolor=BG_PANEL, edgecolor=BORDER, labelcolor=FG)
+
+        parts = []
+        if self._csv_path:
+            parts.append(self._csv_path.name)
+        if self._alicat_file_path and not (self._alicat.is_connected and self._alicat_logging):
+            parts.append(f"+ {self._alicat_file_path.name}")
+        ax.set_title("  ·  ".join(parts), fontsize=8, color=FG_DIM, pad=4)
+
+    def _draw_gas(self, ax, adf: pd.DataFrame):
+        _style_ax(ax)
+        ta = pd.to_datetime(adf["timestamp"])
+
+        handles = []
+        if "pressure" in adf.columns:
+            vals = pd.to_numeric(adf["pressure"], errors="coerce")
+            l, = ax.plot(ta, vals, lw=0.85, color=C_PRESS, label="Pressure")
+            handles.append(l)
+            ax.set_ylabel("Pressure", color=C_PRESS)
+            ax.tick_params(axis="y", labelcolor=C_PRESS)
+
+        if "mass_flow" in adf.columns:
+            ax2 = ax.twinx()
+            _style_ax(ax2, grid=False)
+            vals2 = pd.to_numeric(adf["mass_flow"], errors="coerce")
+            l2, = ax2.plot(ta, vals2, lw=0.85, color=C_FLOW, label="Mass flow")
+            handles.append(l2)
+            ax2.set_ylabel("Mass flow", color=C_FLOW)
+            ax2.tick_params(axis="y", labelcolor=C_FLOW)
+            ax2.spines["right"].set_edgecolor(C_FLOW)
+
+        ax.set_xlabel("Time")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        _auto_rotate_xlabels(ax)
+        ax.spines["left"].set_edgecolor(C_PRESS if "pressure" in adf.columns else BORDER)
+
+        if handles:
+            ax.legend(handles=handles, loc="upper right", framealpha=0.25,
+                      facecolor=BG_PANEL, edgecolor=BORDER, labelcolor=FG)
+
+    def _draw_scatter(self, ax, merged: pd.DataFrame, unit: str, mult: float,
+                      col: str, colour: str, label: str):
+        _style_ax(ax)
+        ax.set_xlabel(f"Spin freq ({unit})", color=FG)
+        ax.set_ylabel(label, color=colour)
+        ax.tick_params(axis="y", labelcolor=colour)
+        ax.spines["left"].set_edgecolor(colour)
+
+        if merged.empty or col not in merged.columns:
+            ax.text(0.5, 0.5, "No Alicat data", ha="center", va="center",
+                    color=FG_DIM, transform=ax.transAxes, fontsize=8)
+            return
+
+        x = merged["frequency_hz"] * mult
+        y = pd.to_numeric(merged[col], errors="coerce")
+        mask = x.notna() & y.notna()
+        if mask.sum() < 2:
+            ax.text(0.5, 0.5, "Insufficient overlap", ha="center", va="center",
+                    color=FG_DIM, transform=ax.transAxes, fontsize=8)
+            return
+
+        # Colour by time index → shows hysteresis / spin-up path
+        idx = np.arange(mask.sum())
+        sc  = ax.scatter(x[mask], y[mask], c=idx, cmap="plasma",
+                         s=2.5, alpha=0.7, linewidths=0, rasterized=True)
+        cb  = self._fig.colorbar(sc, ax=ax, pad=0.02, fraction=0.05)
+        cb.set_label("time →", fontsize=6, color=FG_DIM)
+        cb.ax.tick_params(labelsize=6, labelcolor=FG_DIM, colors=FG_DIM)
+        cb.outline.set_edgecolor(BORDER)
+
+        # Linear trend
+        try:
+            xv, yv = x[mask].values, y[mask].values
+            p  = np.polyfit(xv, yv, 1)
+            xf = np.linspace(xv.min(), xv.max(), 200)
+            ax.plot(xf, np.polyval(p, xf), lw=1.0, ls="--",
+                    color=C_MEAN, alpha=0.7, zorder=5)
+        except Exception:
+            pass
+
+        ax.set_title(f"Freq vs {label}", fontsize=7.5, color=FG_DIM, pad=3)
+
+    # ── Alicat ─────────────────────────────────────────────────────────────
+
+    def _get_alicat_df(self) -> pd.DataFrame:
+        """Return the best available Alicat dataset.
+
+        Priority: live serial data (if connected, even before logging starts)
+        → loaded historical file.
+        """
+        if self._alicat.is_connected:
+            live = self._alicat.get_dataframe()
+            if not live.empty:
+                return live
+        return self._alicat_file_df
+
+    def _open_alicat_file(self):
+        path = filedialog.askopenfilename(
+            title="Open Alicat log CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            df = load_alicat_csv(path)
+            self._alicat_file_df   = df
+            self._alicat_file_path = Path(path)
+            n    = len(df)
+            t0   = df["timestamp"].iloc[0].strftime("%H:%M:%S") if n else "–"
+            t1   = df["timestamp"].iloc[-1].strftime("%H:%M:%S") if n else "–"
+            self._alicat_file_lbl.configure(
+                text=f"  {self._alicat_file_path.name}  ", fg=FG)
+            self._status(f"Alicat file loaded: {n:,} rows  ·  {t0} – {t1}")
+            self._redraw()
+        except Exception as exc:
+            messagebox.showerror("Alicat file", str(exc))
+
+    def _clear_alicat_file(self):
+        self._alicat_file_df   = pd.DataFrame()
+        self._alicat_file_path = None
+        self._alicat_file_lbl.configure(text="  no file loaded  ", fg=FG_DIM)
+        self._status("Alicat file cleared.")
+        self._redraw()
+
+    def _scan_ports(self):
+        if not HAS_SERIAL:
+            return
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self._port_cb["values"] = ports
+        if ports and not self._port_var.get():
+            self._port_var.set(ports[0])
+
+    def _browse_alicat_csv(self):
+        path = filedialog.asksaveasfilename(
+            title="Alicat log file",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile="alicat_log.csv",
+        )
+        if path:
+            self._alicat_csv_path = Path(path)
+            self._alicat_csv_lbl.configure(
+                text=f"  {self._alicat_csv_path.name}  ", fg=FG)
+
+    def _toggle_alicat_conn(self):
+        if self._alicat.is_connected:
+            self._alicat_logging = False
+            self._stop_live_redraw()
+            self._alicat.disconnect()
+            self._conn_btn.configure(text="Connect")
+            self._log_btn.configure(state="disabled", text="▶  Start logging")
+            self._alicat_lbl.configure(text="Disconnected.", fg=FG_DIM)
+            if hasattr(self, "_ctl_status_lbl"):
+                self._ctl_status_lbl.configure(text="Not connected", fg=FG_DIM)
+            for lbl in (self._ctl_p_lbl, self._ctl_t_lbl,
+                        self._ctl_q_lbl, self._ctl_sp_lbl):
+                lbl.configure(text="–")
+            self._redraw()
+        else:
+            port = self._port_var.get()
+            if not port:
+                messagebox.showwarning("Alicat", "Select a serial port first.")
+                return
+            try:
+                baud = int(self._baud_var.get())
+                self._alicat = AlicatLogger(port, address=self._addr_var.get())
+                self._alicat.connect(baud=baud)
+                self._conn_btn.configure(text="Disconnect")
+                self._log_btn.configure(state="normal")
+                self._alicat_lbl.configure(text=f"Connected: {port}", fg=GREEN)
+                if hasattr(self, "_ctl_status_lbl"):
+                    self._ctl_status_lbl.configure(
+                        text=f"Connected  ·  {port}", fg=GREEN)
+                self._start_live_redraw()
+            except Exception as exc:
+                messagebox.showerror("Alicat", str(exc))
+
+    def _toggle_alicat_log(self):
+        if not self._alicat.is_connected:
+            return
+        self._alicat_logging = not self._alicat_logging
+        if self._alicat_logging:
+            # Start CSV file logging if a path is set
+            if self._alicat_csv_path:
+                try:
+                    self._alicat.start_csv_log(self._alicat_csv_path)
+                    csv_note = f"  →  {self._alicat_csv_path.name}"
+                except Exception as exc:
+                    messagebox.showerror("Alicat CSV", f"Could not open log file:\n{exc}")
+                    self._alicat_logging = False
+                    return
+            else:
+                csv_note = "  (no CSV file set)"
+            self._log_btn.configure(text="⏹  Stop logging")
+            self._alicat_lbl.configure(
+                text=f"Logging{csv_note}", fg=GREEN)
+        else:
+            self._alicat.stop_csv_log()
+            self._log_btn.configure(text="▶  Start logging")
+            self._alicat_lbl.configure(text="Connected (paused)", fg=ACCENT)
+
+    def _poll_alicat_status(self):
+        if self._alicat.is_connected:
+            r = self._alicat.last_reading
+            if r:
+                # Update status label
+                parts = []
+                for k, lbl in [("pressure", "P"), ("temperature", "T"), ("mass_flow", "Q")]:
+                    if k in r:
+                        try:
+                            parts.append(f"{lbl}: {float(r[k]):.2f}")
+                        except (ValueError, TypeError):
+                            pass
+                rows = self._alicat.csv_rows_written
+                csv_info = f"  [{rows} rows→CSV]" if rows > 0 and self._alicat_logging else ""
+                if parts and hasattr(self, "_alicat_lbl"):
+                    self._alicat_lbl.configure(
+                        text="   ".join(parts) + csv_info, fg=GREEN)
+
+                # Update control panel tiles
+                self._update_control_readout(r)
+
+            if self._alicat.error:
+                err_msg = f"Error: {self._alicat.error}"
+                if hasattr(self, "_alicat_lbl"):
+                    self._alicat_lbl.configure(text=err_msg, fg=RED)
+                if hasattr(self, "_ctl_status_lbl"):
+                    raw_preview = self._alicat.last_raw[:50] if self._alicat.last_raw else ""
+                    self._ctl_status_lbl.configure(
+                        text=f"{err_msg}  ·  last raw: {raw_preview!r}", fg=RED)
+            elif not self._alicat.last_reading and hasattr(self, "_ctl_status_lbl"):
+                # Connected but no successful reading yet — show raw to help debug
+                raw_preview = self._alicat.last_raw[:60] if self._alicat.last_raw else "waiting for response…"
+                n_readings = len(self._alicat._data)
+                self._ctl_status_lbl.configure(
+                    text=f"{n_readings} readings  ·  raw: {raw_preview!r}", fg=AMBER)
+
+        self.after(1000, self._poll_alicat_status)
+
+    def _update_control_readout(self, r: dict):
+        """Push latest Alicat reading into the control-panel tiles."""
+        if not hasattr(self, "_ctl_p_lbl"):
+            return
+
+        def _fmt(key, decimals=3):
+            try:
+                return f"{float(r[key]):.{decimals}f}"
+            except (KeyError, ValueError, TypeError):
+                return "–"
+
+        self._ctl_p_lbl.configure(text=_fmt("pressure", 4))
+        self._ctl_t_lbl.configure(text=_fmt("temperature", 2))
+        self._ctl_q_lbl.configure(text=_fmt("mass_flow", 4))
+        sp_str = _fmt("setpoint", 4)
+        self._ctl_sp_lbl.configure(text=sp_str)
+        # Pre-fill the setpoint entry with the live value (only when field untouched)
+        try:
+            float(self._sp_entry_var.get())
+        except ValueError:
+            pass
+        else:
+            if self._sp_entry_var.get() == "0.0000" and sp_str != "–":
+                self._sp_entry_var.set(sp_str)
+
+        n_readings = len(self._alicat._data)
+        rows = self._alicat.csv_rows_written
+        log_info = f"  ·  {rows} rows→CSV" if rows > 0 and self._alicat_logging else ""
+        raw_preview = self._alicat.last_raw[:60] if self._alicat.last_raw else "waiting…"
+        self._ctl_status_lbl.configure(
+            text=f"{n_readings} readings  ·  {raw_preview}{log_info}", fg=GREEN)
+
+    def _open_serial_monitor(self):
+        """Open a live scrolling window showing raw TX/RX bytes."""
+        win = tk.Toplevel(self)
+        win.title("Serial monitor")
+        win.configure(bg=BG)
+        win.geometry("700x400")
+
+        hdr = tk.Frame(win, bg=BG_PANEL, pady=4, padx=8)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Raw serial log  (TX → device, RX ← device)",
+                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SM, anchor="w").pack(side="left")
+
+        # Manual TX entry
+        tx_var = tk.StringVar(value="A\r")
+        tx_entry = _entry(hdr, tx_var, width=12)
+        tx_entry.pack(side="right", padx=(4, 0))
+        tk.Label(hdr, text="Send:", bg=BG_PANEL, fg=FG, font=FONT_SM).pack(side="right")
+
+        txt = tk.Text(win, bg=BG_ENTRY, fg=FG, font=("Menlo", 10),
+                      relief="flat", bd=0, wrap="none",
+                      insertbackground=FG,
+                      highlightbackground=BORDER, highlightthickness=1)
+        txt.pack(fill="both", expand=True, padx=6, pady=6)
+
+        sb = ttk.Scrollbar(win, command=txt.yview)
+        sb.pack(side="right", fill="y")
+        txt.configure(yscrollcommand=sb.set)
+
+        # Colour tags
+        txt.tag_configure("ts",  foreground=FG_DIM)
+        txt.tag_configure("tx",  foreground=ACCENT)
+        txt.tag_configure("rx",  foreground=GREEN)
+        txt.tag_configure("err", foreground=RED)
+        txt.tag_configure("hex", foreground=AMBER)
+
+        def _manual_send():
+            if not self._alicat.is_connected:
+                return
+            raw = tx_var.get().replace("\\r", "\r").replace("\\n", "\n")
+            try:
+                c = self._alicat._conn
+                c.reset_input_buffer()
+                c.rts = True
+                c.write(raw.encode())
+                c.flush()
+                time.sleep(0.015)
+                c.rts = False
+                time.sleep(0.05)
+                resp = c.read_until(b"\r")
+                decoded = resp.decode("ascii", errors="replace")
+                ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                txt.insert("end", f"{ts}  ", "ts")
+                txt.insert("end", f"TX {raw!r}  ", "tx")
+                txt.insert("end", f"RX({len(resp)}B): {decoded!r}\n", "rx" if decoded.strip() else "hex")
+                txt.see("end")
+            except Exception as exc:
+                txt.insert("end", f"Error: {exc}\n", "err")
+
+        _btn(hdr, "Send", _manual_send).pack(side="right", padx=(0, 6))
+        tx_entry.bind("<Return>", lambda _: _manual_send())
+
+        last_len = [0]
+
+        def _refresh():
+            if not win.winfo_exists():
+                return
+            log = list(self._alicat._raw_log)
+            if len(log) != last_len[0]:
+                txt.delete("1.0", "end")
+                for line in log:
+                    # colour TX part blue, RX part green
+                    if "RX" in line and "(hex:" in line:
+                        txt.insert("end", line + "\n", "hex")
+                    elif "RX" in line:
+                        txt.insert("end", line + "\n", "rx")
+                    else:
+                        txt.insert("end", line + "\n", "ts")
+                txt.see("end")
+                last_len[0] = len(log)
+            win.after(500, _refresh)
+
+        _refresh()
+
+    def _send_setpoint(self):
+        if not self._alicat.is_connected:
+            messagebox.showwarning("Alicat", "Not connected.")
+            return
+        try:
+            val = float(self._sp_entry_var.get())
+        except ValueError:
+            messagebox.showerror("Setpoint", "Enter a valid number.")
+            return
+        try:
+            self._alicat.set_setpoint(val)
+            self._ctl_status_lbl.configure(
+                text=f"Setpoint → {val:.4f} sent", fg=ACCENT)
+        except Exception as exc:
+            messagebox.showerror("Setpoint", str(exc))
+
+    _GAS_IDS = {
+        "Air":  0,
+        "Ar":   1,
+        "CH₄":  2,
+        "CO":   3,
+        "CO₂":  4,
+        "C₂H₆": 5,
+        "H₂":   6,
+        "He":   7,
+        "N₂":   8,
+    }
+
+    def _send_gas(self):
+        if not self._alicat.is_connected:
+            return
+        gas  = self._gas_var.get()
+        gid  = self._GAS_IDS.get(gas, 0)
+        try:
+            self._alicat.set_gas(gid)
+            self._ctl_status_lbl.configure(text=f"Gas → {gas} sent", fg=ACCENT)
+        except Exception as exc:
+            messagebox.showerror("Gas", str(exc))
+
+    def _start_live_redraw(self):
+        """Begin periodic plot refresh driven by live Alicat data."""
+        if self._live_redraw_job is not None:
+            return  # already running
+        self._live_redraw_tick()
+
+    def _stop_live_redraw(self):
+        if self._live_redraw_job is not None:
+            self.after_cancel(self._live_redraw_job)
+            self._live_redraw_job = None
+
+    def _live_redraw_tick(self):
+        if self._alicat.is_connected:
+            # Only redraw from the live timer if PicoScope auto-refresh is off
+            # (to avoid double-drawing when both are active).
+            if not self._auto_var.get():
+                self._redraw()
+            self._live_redraw_job = self.after(1000, self._live_redraw_tick)
+        else:
+            self._live_redraw_job = None
+
+    # ── Export ─────────────────────────────────────────────────────────────
+
+    def _use_visible_range(self):
+        try:
+            ax  = self._fig.axes[0]
+            lo, hi = ax.get_xlim()
+            fmt = "%Y-%m-%d %H:%M:%S"
+            self._t_from.delete(0, "end")
+            self._t_from.insert(0, mdates.num2date(lo).strftime(fmt))
+            self._t_to.delete(0, "end")
+            self._t_to.insert(0, mdates.num2date(hi).strftime(fmt))
+        except Exception:
+            pass
+
+    def _clipped(self):
+        spin = self._get_spin_df()
+        alic = self._get_alicat_df()
+        t0_s = self._t_from.get().strip()
+        t1_s = self._t_to.get().strip()
+        try:
+            if t0_s:
+                t0 = pd.Timestamp(t0_s)
+                spin = spin[spin["timestamp"] >= t0]
+                if not alic.empty:
+                    alic = alic[pd.to_datetime(alic["timestamp"]) >= t0]
+            if t1_s:
+                t1 = pd.Timestamp(t1_s)
+                spin = spin[spin["timestamp"] <= t1]
+                if not alic.empty:
+                    alic = alic[pd.to_datetime(alic["timestamp"]) <= t1]
+        except Exception as exc:
+            messagebox.showerror("Time range", str(exc))
+        return spin, alic
+
+    def _export_plot(self, fmt: str):
+        spin, alic = self._clipped()
+        if spin.empty:
+            messagebox.showwarning("Export", "No data in selected range.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=f".{fmt}",
+            filetypes=[(fmt.upper(), f"*.{fmt}"), ("All files", "*.*")],
+            initialfile=f"mas_plot.{fmt}",
+        )
+        if not path:
+            return
+
+        import matplotlib.pyplot as plt
+        unit = self._unit_var.get()
+        mult = UNIT_MULTS[unit]
+        has_alic = not alic.empty
+
+        if has_alic:
+            fig = plt.figure(figsize=(10, 6), facecolor="white")
+            gs  = fig.add_gridspec(2, 2, width_ratios=[3, 1.8],
+                                   height_ratios=[1.6, 1],
+                                   hspace=0.08, wspace=0.38,
+                                   left=0.07, right=0.97, top=0.93, bottom=0.10)
+            ax_f  = fig.add_subplot(gs[0, 0])
+            ax_g  = fig.add_subplot(gs[1, 0], sharex=ax_f)
+            ax_s1 = fig.add_subplot(gs[0, 1])
+            ax_s2 = fig.add_subplot(gs[1, 1])
+        else:
+            fig, ax_f = plt.subplots(1, 1, figsize=(7, 3.5),
+                                     facecolor="white",
+                                     constrained_layout=True)
+            ax_g = ax_s1 = ax_s2 = None
+
+        # -- publication light style --
+        for ax in fig.get_axes():
+            ax.set_facecolor("white")
+            ax.grid(True, lw=0.3, alpha=0.5)
+
+        t, f = spin["timestamp"], spin["frequency_hz"] * mult
+        mean_f, std_f = float(f.mean()), float(f.std())
+
+        if self._show_sigma_var.get():
+            ax_f.fill_between(t, mean_f - std_f, mean_f + std_f,
+                              alpha=0.10, color=C_MEAN,
+                              label=f"±1σ  {std_f:.4f} {unit}")
+        ax_f.plot(t, f, lw=0.8, color=C_FREQ, label="Spin frequency")
+        if self._show_mean_var.get():
+            ax_f.axhline(mean_f, ls="--", lw=0.9, color=C_MEAN,
+                         label=f"Mean  {mean_f:.4f} {unit}")
+        ax_f.set_ylabel(f"Frequency ({unit})")
+        ax_f.legend(fontsize=7)
+        ax_f.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        title_parts = []
+        if self._csv_path:
+            title_parts.append(self._csv_path.name)
+        if self._alicat_file_path and not (self._alicat.is_connected and self._alicat_logging):
+            title_parts.append(self._alicat_file_path.name)
+        ax_f.set_title(
+            "MAS spin frequency  —  " + "  ·  ".join(title_parts) if title_parts
+            else "MAS spin frequency",
+            fontsize=9,
+        )
+        ax_f.text(0.01, 0.02,
+                  f"n={len(f):,}  mean={mean_f:.4f} {unit}  σ={std_f:.4f} {unit}  σ/f={std_f/mean_f:.2e}",
+                  transform=ax_f.transAxes, fontsize=6, va="bottom",
+                  bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8, ec="lightgrey"))
+        if ax_g is None:
+            ax_f.set_xlabel("Time")
+            fig.autofmt_xdate(rotation=20)
+        else:
+            ax_f.set_xticklabels([])
+
+        if ax_g is not None:
+            ta = pd.to_datetime(alic["timestamp"])
+            if "pressure" in alic.columns:
+                ax_g.plot(ta, pd.to_numeric(alic["pressure"], errors="coerce"),
+                          lw=0.8, color=C_PRESS, label="Pressure")
+                ax_g.set_ylabel("Pressure", color=C_PRESS)
+            if "mass_flow" in alic.columns:
+                axr = ax_g.twinx()
+                axr.plot(ta, pd.to_numeric(alic["mass_flow"], errors="coerce"),
+                         lw=0.8, color=C_FLOW, label="Mass flow")
+                axr.set_ylabel("Mass flow", color=C_FLOW)
+            ax_g.set_xlabel("Time")
+            ax_g.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+            ax_g.legend(fontsize=7)
+            fig.autofmt_xdate(rotation=20)
+
+            merged = self._merge_for_scatter(spin, alic)
+            for ax_sc, col, colour, lbl in [
+                (ax_s1, "pressure",  C_PRESS, "Pressure"),
+                (ax_s2, "mass_flow", C_FLOW,  "Mass flow"),
+            ]:
+                ax_sc.set_xlabel(f"Spin freq ({unit})", fontsize=8)
+                ax_sc.set_ylabel(lbl, color=colour, fontsize=8)
+                if not merged.empty and col in merged.columns:
+                    x = merged["frequency_hz"] * mult
+                    y = pd.to_numeric(merged[col], errors="coerce")
+                    mask = x.notna() & y.notna()
+                    if mask.sum() >= 2:
+                        idx = np.arange(mask.sum())
+                        ax_sc.scatter(x[mask], y[mask], c=idx, cmap="plasma",
+                                      s=2, alpha=0.7, linewidths=0, rasterized=True)
+                        xv, yv = x[mask].values, y[mask].values
+                        p  = np.polyfit(xv, yv, 1)
+                        xf = np.linspace(xv.min(), xv.max(), 200)
+                        ax_sc.plot(xf, np.polyval(p, xf), lw=1.0, ls="--",
+                                   color=C_MEAN, alpha=0.7)
+                ax_sc.set_title(f"Freq vs {lbl}", fontsize=8)
+
+        fig.savefig(path, dpi=300)
+        plt.close(fig)
+        self._status(f"Plot saved → {Path(path).name}")
+
+    def _export_csv(self):
+        spin, alic = self._clipped()
+        if spin.empty:
+            messagebox.showwarning("Export", "No data in selected range.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile="mas_data.csv",
+        )
+        if not path:
+            return
+        unit = self._unit_var.get()
+        out  = spin[["timestamp", "elapsed_s", "frequency_hz"]].copy()
+        out[f"frequency_{unit}"] = out["frequency_hz"] * UNIT_MULTS[unit]
+        if not alic.empty:
+            alic = alic.copy()
+            alic["timestamp"] = pd.to_datetime(alic["timestamp"])
+            out = pd.merge_asof(
+                out.sort_values("timestamp"),
+                alic.sort_values("timestamp"),
+                on="timestamp", direction="nearest",
+                tolerance=pd.Timedelta("2s"),
+            )
+        out.to_csv(path, index=False)
+        self._status(f"Data saved → {Path(path).name}  ({len(out):,} rows)")
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _status(self, msg: str):
+        self._status_var.set(msg)
+        self.update_idletasks()
+
+
+# ── Utility ────────────────────────────────────────────────────────────────
+
+def _auto_rotate_xlabels(ax, rotation=25):
+    for lbl in ax.get_xticklabels():
+        lbl.set_rotation(rotation)
+        lbl.set_ha("right")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    app = MASMonitor()
+    app.mainloop()

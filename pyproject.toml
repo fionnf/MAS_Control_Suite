@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mas-monitor"
+version = "2.0.0"
+description = "Live MAS rotor frequency monitor with Alicat flow/pressure integration"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.8",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyserial>=3.5",
+    "pyftdi>=0.55",
+]
+
+[project.optional-dependencies]
+filters = [
+    "scipy>=1.12",   # enables Savitzky-Golay and Gaussian filters
+]
+
+[project.scripts]
+mas-monitor = "scripts.mas_monitor:main"
