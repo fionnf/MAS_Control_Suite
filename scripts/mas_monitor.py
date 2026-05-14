@@ -581,11 +581,6 @@ class MASMonitor(tk.Tk):
         self._routine_status = ""   # written by thread, read by UI tick
         self._ramp_rate_var  = tk.StringVar(value="0.1")   # barg/s; 0 = instant
 
-        # Frequency controller state
-        self._fc_thread:   threading.Thread | None = None
-        self._fc_stop      = threading.Event()
-        self._fc_status    = ""
-        self._fc_running   = False
 
         # ttk style overrides for comboboxes — keep default Aqua theme so that
         # tk.Button respects explicit bg colours; only restyle TCombobox fields.
@@ -971,91 +966,6 @@ class MASMonitor(tk.Tk):
             font=FONT_SM, anchor="w")
         self._routine_lbl.pack(fill="x", padx=8, pady=(2, 8))
 
-        # ── Frequency controller ──────────────────────────────────────────
-        fcg = _group(routine_tab, "Frequency Control  (feedback loop)")
-        fcg.pack(side="left", padx=(0, 10), fill="both", expand=True, pady=2)
-
-        # Mode selector
-        r = tk.Frame(fcg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(8, 4))
-        _label2(r, "Mode:").pack(side="left")
-        self._fc_mode_var = tk.StringVar(value="drive")
-        tk.Radiobutton(r, text="Drive only  (1 Alicat)", variable=self._fc_mode_var,
-            value="drive", bg=LFR_BG, fg=FG, font=FONT, selectcolor=BG_ENTRY,
-            activebackground=LFR_BG, activeforeground=FG,
-            command=self._fc_update_mode).pack(side="left", padx=(8, 16))
-        tk.Radiobutton(r, text="Drive + Bearing  (2 Alicats — Bruker sequence)",
-            variable=self._fc_mode_var, value="drive_bearing",
-            bg=LFR_BG, fg=FG, font=FONT, selectcolor=BG_ENTRY,
-            activebackground=LFR_BG, activeforeground=FG,
-            command=self._fc_update_mode).pack(side="left")
-
-        # Target + stability
-        r = tk.Frame(fcg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(2, 4))
-        _label2(r, "Target:").pack(side="left")
-        self._fc_target_var = tk.StringVar(value="50.0")
-        _entry(r, self._fc_target_var, width=9).pack(side="left", padx=(4, 2))
-        self._fc_target_unit_var = tk.StringVar(value="kHz")
-        _combo(r, self._fc_target_unit_var, ["Hz", "kHz", "kRPM"], width=6).pack(side="left", padx=(0, 16))
-        _label2(r, "Stability: last").pack(side="left")
-        self._fc_stab_n_var = tk.StringVar(value="20")
-        _entry(r, self._fc_stab_n_var, width=4).pack(side="left", padx=(4, 2))
-        _label2(r, "readings, σ <").pack(side="left", padx=(0, 4))
-        self._fc_stab_sigma_var = tk.StringVar(value="0.5")
-        _entry(r, self._fc_stab_sigma_var, width=5).pack(side="left", padx=(0, 2))
-        self._fc_stab_unit_var = tk.StringVar(value="kHz")
-        _combo(r, self._fc_stab_unit_var, ["Hz", "kHz", "kRPM"], width=6).pack(side="left")
-
-        # Per-Alicat limit panels (side by side)
-        param_row = tk.Frame(fcg, bg=LFR_BG); param_row.pack(fill="x", padx=8, pady=(4, 4))
-
-        def _fc_param_group(parent, title, pfx):
-            """Build min/max/start/gain fields; return dict of StringVars."""
-            fg2 = _group(parent, title)
-            fg2.pack(side="left", padx=(0, 12), fill="y")
-            d = {}
-            for lbl, key, defval in [
-                ("Min SP (bar):",   "min",   "0.0"),
-                ("Max SP (bar):",   "max",   "3.0"),
-                ("Start SP (bar):", "start", "0.5"),
-                ("Step (bar):",     "step",  "0.05"),
-                ("Gain (bar/kHz):", "gain",  "0.02"),
-            ]:
-                rr = tk.Frame(fg2, bg=LFR_BG); rr.pack(fill="x", padx=8, pady=1)
-                _label2(rr, lbl).pack(side="left")
-                v = tk.StringVar(value=defval)
-                _entry(rr, v, width=7).pack(side="left", padx=(4, 0))
-                d[key] = v
-            return fg2, d
-
-        drive_grp, self._fc_drive = _fc_param_group(param_row, "Drive  (Alicat A)", "A")
-        bear_grp,  self._fc_bear  = _fc_param_group(param_row, "Bearing  (Alicat B)", "B")
-        self._fc_bear_grp = bear_grp   # hidden in drive-only mode
-
-        # Wobble settings (bearing only)
-        wf = tk.Frame(bear_grp, bg=LFR_BG); wf.pack(fill="x", padx=8, pady=(4, 6))
-        _label2(wf, "Wobble Δ (bar):").pack(side="left")
-        self._fc_wobble_var = tk.StringVar(value="0.02")
-        _entry(wf, self._fc_wobble_var, width=6).pack(side="left", padx=(4, 8))
-        _label2(wf, "every (s):").pack(side="left")
-        self._fc_wobble_period_var = tk.StringVar(value="30")
-        _entry(wf, self._fc_wobble_period_var, width=5).pack(side="left", padx=(4, 0))
-
-        # Control row
-        r = tk.Frame(fcg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(4, 4))
-        self._fc_start_btn = _btn(r, "▶  Start frequency control", self._fc_toggle,
-                                  bg="#1e3d1e")
-        self._fc_start_btn.pack(side="left", padx=(0, 8))
-        self._fc_status_lbl = tk.Label(r, text="Idle", bg=LFR_BG, fg=FG_DIM,
-                                       font=FONT_SM, anchor="w")
-        self._fc_status_lbl.pack(side="left", fill="x", expand=True)
-
-        # Phase / step progress
-        self._fc_phase_lbl = tk.Label(fcg, text="", bg=LFR_BG, fg=ACCENT,
-                                      font=FONT_SM, anchor="w")
-        self._fc_phase_lbl.pack(fill="x", padx=8, pady=(0, 8))
-
-        self._fc_update_mode()   # hide bearing group if drive-only
-
         # Show Frequency tab by default
         _show_tab("Frequency")
 
@@ -1132,8 +1042,10 @@ class MASMonitor(tk.Tk):
         ui["gas_cb"].bind("<<ComboboxSelected>>", lambda _, i=idx: self._send_gas(i))
 
         rz = tk.Frame(cg, bg=LFR_BG); rz.pack(fill="x", padx=8, pady=(2, 2))
-        _btn(rz, "Zero P", lambda i=idx: self._zero_pressure(i), bg="#2a2a1e").pack(side="left", padx=(0, 4))
-        _btn(rz, "Clear offset", lambda i=idx: self._clear_pressure_offset(i)).pack(side="left", padx=(0, 8))
+        _btn(rz, "Set Zero", lambda i=idx: self._set_zero_from_reading(i),
+             bg="#1e2a3d").pack(side="left", padx=(0, 4))
+        _btn(rz, "Clear offset", lambda i=idx: self._clear_pressure_offset(i)).pack(side="left", padx=(0, 4))
+        _btn(rz, "Abs zero", lambda i=idx: self._zero_pressure(i), bg="#2a2a1e").pack(side="left", padx=(0, 8))
         ui["pressure_offset"] = LOCAL_ATMOS
         ui["zero_lbl"] = tk.Label(rz, text=f"offset: {ui['pressure_offset']:.5f} bar",
                                    bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
@@ -1796,8 +1708,10 @@ class MASMonitor(tk.Tk):
         def _fmt(key, decimals=3):
             try:
                 v = float(r[key])
-                if key in ("pressure", "setpoint"):
-                    v -= offset
+                if key == "pressure":
+                    v -= offset                         # user-adjustable gauge zero
+                elif key == "setpoint":
+                    v = 0.0 if v <= 0.0 else v - LOCAL_ATMOS   # fixed atm → barg; 0 = closed
                 return f"{v:.{decimals}f}"
             except (KeyError, ValueError, TypeError):
                 return "–"
@@ -1898,309 +1812,6 @@ class MASMonitor(tk.Tk):
         _refresh()
 
     # ── Spin routines ──────────────────────────────────────────────────────
-
-    # ── Frequency controller ───────────────────────────────────────────────
-
-    def _fc_update_mode(self):
-        """Show/hide the Bearing parameter group based on selected mode."""
-        if self._fc_mode_var.get() == "drive_bearing":
-            self._fc_bear_grp.pack(side="left", padx=(0, 12), fill="y")
-        else:
-            self._fc_bear_grp.pack_forget()
-
-    def _fc_get_latest_freq_hz(self) -> float | None:
-        """Return the single most-recent frequency reading in Hz, or None."""
-        if self._df.empty or "frequency_hz" not in self._df.columns:
-            return None
-        last = self._df["frequency_hz"].dropna()
-        return float(last.iloc[-1]) if not last.empty else None
-
-    def _fc_recent_freq_hz(self, n: int) -> "np.ndarray | None":
-        """Return the last *n* valid frequency readings as a numpy array, or None."""
-        if self._df.empty or "frequency_hz" not in self._df.columns:
-            return None
-        vals = self._df["frequency_hz"].dropna().values
-        if len(vals) == 0:
-            return None
-        return vals[-n:] if len(vals) >= n else vals
-
-    def _fc_is_stable(self) -> tuple[bool, str]:
-        """Check whether the current frequency reading is stable enough to engage."""
-        try:
-            n     = max(3, int(self._fc_stab_n_var.get()))
-            sigma = float(self._fc_stab_sigma_var.get())
-            unit  = self._fc_stab_unit_var.get()
-            sigma_hz = sigma / UNIT_MULTS.get(unit, 1.0)
-        except ValueError:
-            return False, "Bad stability parameters"
-
-        vals = self._fc_recent_freq_hz(n)
-        if vals is None or len(vals) < 3:
-            return False, "Not enough frequency readings"
-
-        std = float(np.std(vals))
-        cur = float(vals[-1])
-        cur_disp = cur * UNIT_MULTS.get(unit, 1.0)
-        std_disp = std * UNIT_MULTS.get(unit, 1.0)
-        if std > sigma_hz:
-            return False, (f"Unstable: σ = {std_disp:.3f} {unit}  "
-                           f"(need < {sigma:.3f})  @  {cur_disp:.3f} {unit}")
-        return True, f"Stable: σ = {std_disp:.3f} {unit}  @  {cur_disp:.3f} {unit}"
-
-    def _fc_toggle(self):
-        if self._fc_running:
-            self._fc_stop.set()
-            self._fc_start_btn.configure(text="▶  Start frequency control", bg="#1e3d1e")
-            self._fc_status_lbl.configure(text="Stopped", fg=FG_DIM)
-            self._fc_phase_lbl.configure(text="")
-            self._fc_running = False
-        else:
-            # Preflight checks
-            mode = self._fc_mode_var.get()
-            if not self._alicats[0].is_connected:
-                messagebox.showwarning("Freq control", "Alicat A (Drive) must be connected.")
-                return
-            if mode == "drive_bearing" and not self._alicats[1].is_connected:
-                messagebox.showwarning("Freq control", "Alicat B (Bearing) must be connected.")
-                return
-            stable, msg = self._fc_is_stable()
-            if not stable:
-                messagebox.showwarning("Freq control",
-                    f"Frequency reading not stable enough to engage.\n\n{msg}\n\n"
-                    "Check that PicoScope is logging and Auto-refresh is on.")
-                return
-            self._fc_stop.clear()
-            self._fc_running = True
-            self._fc_start_btn.configure(text="⏹  Stop", bg="#3d1e1e")
-            self._fc_status_lbl.configure(text="Starting…", fg=ACCENT)
-            self._fc_thread = threading.Thread(
-                target=self._fc_run_loop if mode == "drive" else self._fc_run_bruker,
-                daemon=True)
-            self._fc_thread.start()
-            self._fc_poll_status()
-
-    def _fc_poll_status(self):
-        """Called on the main thread every 500 ms while the controller is running."""
-        if not self._fc_running:
-            return
-        if self._fc_thread and not self._fc_thread.is_alive():
-            self._fc_running = False
-            self._fc_start_btn.configure(text="▶  Start frequency control", bg="#1e3d1e")
-            self._fc_status_lbl.configure(text=self._fc_status or "Finished", fg=FG_DIM)
-            self._fc_phase_lbl.configure(text="")
-            return
-        self._fc_status_lbl.configure(text=self._fc_status, fg=GREEN)
-        self.after(500, self._fc_poll_status)
-
-    def _fc_parse_drive(self) -> dict:
-        return {k: float(v.get()) for k, v in self._fc_drive.items()}
-
-    def _fc_parse_bear(self) -> dict:
-        return {k: float(v.get()) for k, v in self._fc_bear.items()}
-
-    def _fc_target_hz(self) -> float:
-        val  = float(self._fc_target_var.get())
-        unit = self._fc_target_unit_var.get()
-        return val / UNIT_MULTS.get(unit, 1.0)
-
-    def _fc_wait(self, seconds: float, phase: str) -> bool:
-        """Sleep in small ticks, updating _fc_status. Returns True if aborted."""
-        steps = max(1, int(seconds / 0.25))
-        for i in range(steps):
-            if self._fc_stop.is_set():
-                return True
-            self._fc_status = f"{phase}  ({(i+1)*0.25:.1f} / {seconds:.0f} s)"
-            time.sleep(0.25)
-        return False
-
-    def _fc_wait_stable(self, phase: str, timeout: float = 120.0) -> bool:
-        """Block until frequency is stable (or timeout). Returns True if aborted."""
-        t0 = time.time()
-        while not self._fc_stop.is_set():
-            if time.time() - t0 > timeout:
-                self._fc_status = f"{phase}  [timeout waiting for stability]"
-                return False
-            stable, msg = self._fc_is_stable()
-            self._fc_status = f"{phase}  |  {msg}"
-            if stable:
-                return True
-            time.sleep(0.5)
-        return False   # aborted
-
-    # ── Drive-only feedback loop ───────────────────────────────────────────
-
-    def _fc_run_loop(self):
-        """Simple proportional feedback on Alicat A (Drive only)."""
-        al    = self._alicats[0]
-        ui    = self._alicat_ui[0]
-        dp    = self._fc_parse_drive()
-        sp    = dp["start"]
-        offset = ui.get("pressure_offset", LOCAL_ATMOS)
-        TICK  = 1.0   # seconds between control updates
-
-        # Set initial setpoint
-        al.set_setpoint(sp + offset)
-        if self._fc_wait(3.0, "Applying initial drive SP"):
-            return
-
-        target_hz = self._fc_target_hz()
-
-        while not self._fc_stop.is_set():
-            # Wait for stable reading
-            if not self._fc_wait_stable("Waiting for stability", timeout=60.0):
-                if self._fc_stop.is_set():
-                    return
-                # proceed anyway after timeout
-
-            freq = self._fc_get_latest_freq_hz()
-            if freq is None:
-                self._fc_status = "No frequency reading — check PicoScope"
-                time.sleep(TICK)
-                continue
-
-            error_hz  = target_hz - freq
-            error_unit = error_hz * UNIT_MULTS.get(self._fc_target_unit_var.get(), 1.0)
-            unit_lbl   = self._fc_target_unit_var.get()
-            delta      = dp["gain"] * error_hz * UNIT_MULTS.get("kHz", 1.0)   # gain is bar/kHz
-            sp_new     = sp + delta
-            sp_new     = max(dp["min"], min(dp["max"], sp_new))
-
-            self._fc_status = (f"Drive SP {sp:.4f} barg  |  "
-                               f"freq {freq * UNIT_MULTS.get(unit_lbl,1):.3f} {unit_lbl}  |  "
-                               f"error {error_unit:+.3f} {unit_lbl}")
-
-            if abs(sp_new - sp) > 1e-5:
-                sp = sp_new
-                al.set_setpoint(sp + offset)
-
-            time.sleep(TICK)
-
-        self._fc_status = "Drive control stopped"
-
-    # ── Bruker-style Drive + Bearing feedback loop ─────────────────────────
-
-    def _fc_run_bruker(self):
-        """
-        Bruker-style spin-up and frequency control with drive + bearing.
-
-        Sequence:
-          Phase 1 — Apply bearing: ramp bearing to start SP, wait for stability.
-          Phase 2 — Apply drive:   ramp drive to start SP, wait for rotor to spin.
-          Phase 3 — Frequency control loop:
-                      • Proportional correction on drive to hit target frequency.
-                      • Periodic bearing wobble (hill-climb on frequency stability)
-                        to find the optimal bearing pressure.
-        """
-        al_d   = self._alicats[0]   # Drive  — Alicat A
-        al_b   = self._alicats[1]   # Bearing — Alicat B
-        ui_d   = self._alicat_ui[0]
-        ui_b   = self._alicat_ui[1]
-        dp     = self._fc_parse_drive()
-        bp     = self._fc_parse_bear()
-        off_d  = ui_d.get("pressure_offset", LOCAL_ATMOS)
-        off_b  = ui_b.get("pressure_offset", LOCAL_ATMOS)
-
-        try:
-            wobble_delta  = float(self._fc_wobble_var.get())
-            wobble_period = float(self._fc_wobble_period_var.get())
-        except ValueError:
-            wobble_delta, wobble_period = 0.02, 30.0
-
-        TICK = 1.0
-
-        def _set_phase(txt):
-            self._fc_status = txt
-
-        # ── Phase 1: Bearing ───────────────────────────────────────────────
-        _set_phase("Phase 1 — Setting bearing pressure")
-        bear_sp = bp["start"]
-        al_b.set_setpoint(bear_sp + off_b)
-        if self._fc_wait(5.0, "Phase 1 — Bearing settling"):
-            return
-
-        # Wait for stable reading (bearing only, rotor may not be spinning yet)
-        _set_phase("Phase 1 — Waiting for bearing stability")
-        time.sleep(3.0)   # short grace period before checking stability
-
-        # ── Phase 2: Drive ─────────────────────────────────────────────────
-        _set_phase("Phase 2 — Applying drive pressure")
-        drive_sp = dp["start"]
-        al_d.set_setpoint(drive_sp + off_d)
-
-        # Wait until rotor starts spinning (frequency appears above noise floor)
-        _set_phase("Phase 2 — Waiting for rotor to spin")
-        spin_timeout = 120.0
-        t0 = time.time()
-        target_hz = self._fc_target_hz()
-        while not self._fc_stop.is_set():
-            freq = self._fc_get_latest_freq_hz()
-            if freq and freq > target_hz * 0.05:   # > 5 % of target
-                break
-            if time.time() - t0 > spin_timeout:
-                _set_phase("Phase 2 — Rotor did not spin up within timeout; continuing")
-                break
-            self._fc_status = (f"Phase 2 — Waiting for spin  |  "
-                               f"freq {(freq or 0) / 1000:.2f} kHz")
-            time.sleep(0.5)
-        if self._fc_stop.is_set():
-            return
-
-        # ── Phase 3: Feedback loop ─────────────────────────────────────────
-        last_wobble_t  = time.time()
-        bear_dir       = +1   # wobble search direction
-        bear_baseline_std = None
-
-        while not self._fc_stop.is_set():
-            freq = self._fc_get_latest_freq_hz()
-            if freq is None:
-                self._fc_status = "Phase 3 — No frequency reading"
-                time.sleep(TICK)
-                continue
-
-            unit_lbl  = self._fc_target_unit_var.get()
-            mult      = UNIT_MULTS.get(unit_lbl, 1.0)
-            error_hz  = target_hz - freq
-            delta     = dp["gain"] * error_hz * 1e-3   # gain is bar/kHz, error in Hz → /1000
-            new_d_sp  = max(dp["min"], min(dp["max"], drive_sp + delta))
-
-            self._fc_status = (f"Phase 3 — Drive {drive_sp:.4f} barg  |  "
-                               f"Bear {bear_sp:.4f} barg  |  "
-                               f"freq {freq * mult:.3f} {unit_lbl}  |  "
-                               f"err {error_hz * mult:+.3f} {unit_lbl}")
-
-            if abs(new_d_sp - drive_sp) > 1e-5:
-                drive_sp = new_d_sp
-                al_d.set_setpoint(drive_sp + off_d)
-
-            # ── Bearing wobble (hill-climb on σ) ──────────────────────────
-            now = time.time()
-            if now - last_wobble_t >= wobble_period:
-                last_wobble_t = now
-
-                # measure baseline σ
-                vals0  = self._fc_recent_freq_hz(10)
-                std0   = float(np.std(vals0)) if vals0 is not None and len(vals0) >= 3 else 1e9
-
-                # try a step in current direction
-                cand = max(bp["min"], min(bp["max"], bear_sp + bear_dir * wobble_delta))
-                al_b.set_setpoint(cand + off_b)
-                time.sleep(3.0)
-                if self._fc_stop.is_set():
-                    return
-                vals1 = self._fc_recent_freq_hz(10)
-                std1  = float(np.std(vals1)) if vals1 is not None and len(vals1) >= 3 else 1e9
-
-                if std1 <= std0:
-                    # improvement — accept and continue in same direction
-                    bear_sp = cand
-                else:
-                    # worse — revert and flip direction
-                    al_b.set_setpoint(bear_sp + off_b)
-                    bear_dir *= -1
-
-            time.sleep(TICK)
-
-        self._fc_status = "Drive + Bearing control stopped"
 
     # ── Spin routines ──────────────────────────────────────────────────────
 
@@ -2490,6 +2101,29 @@ class MASMonitor(tk.Tk):
             text="offset: 0.00000 bar  (absolute mode)", fg=AMBER)
         self._redraw()
 
+    def _set_zero_from_reading(self, idx: int = 0):
+        """Capture the current live pressure reading as the gauge zero.
+        After this the display reads 0 at the current applied pressure."""
+        ui = self._alicat_ui[idx]
+        al = self._alicats[idx]
+        r  = al.last_reading if al.is_connected else None
+        if not r:
+            messagebox.showwarning(
+                f"Alicat {'A' if idx == 0 else 'B'}",
+                "No live reading available — connect the Alicat first.")
+            return
+        try:
+            raw = float(r["pressure"])
+        except (KeyError, ValueError, TypeError):
+            messagebox.showwarning(
+                f"Alicat {'A' if idx == 0 else 'B'}",
+                "Could not read current pressure.")
+            return
+        ui["pressure_offset"] = raw
+        ui["zero_lbl"].configure(
+            text=f"offset: {raw:.5f} bar  (zeroed at reading)", fg=GREEN)
+        self._redraw()
+
     def _send_setpoint(self, idx: int = 0):
         al  = self._alicats[idx]
         ui  = self._alicat_ui[idx]
@@ -2497,10 +2131,11 @@ class MASMonitor(tk.Tk):
             messagebox.showwarning("Alicat", "Not connected.")
             return
         try:
-            # User enters gauge value; add offset to get absolute for the device
+            # User enters gauge pressure (barg).
+            # Device receives absolute = gauge + LOCAL_ATMOS.
+            # SP = 0 is special: send 0.0 absolute → valve fully closed.
             target_gauge = float(ui["sp_entry_var"].get())
-            offset       = ui.get("pressure_offset", LOCAL_ATMOS)
-            target       = target_gauge + offset
+            target = 0.0 if target_gauge <= 0.0 else target_gauge + LOCAL_ATMOS
         except ValueError:
             messagebox.showerror("Setpoint", "Enter a valid number.")
             return
@@ -2522,7 +2157,7 @@ class MASMonitor(tk.Tk):
         if ramp <= 0.0:
             try:
                 al.set_setpoint(target)
-                status_lbl.configure(text=f"Setpoint → {target:.4f} sent", fg=ACCENT)
+                status_lbl.configure(text=f"Setpoint → {target_gauge:.4f} barg sent", fg=ACCENT)
             except Exception as exc:
                 messagebox.showerror("Setpoint", str(exc))
         else:
@@ -2539,7 +2174,7 @@ class MASMonitor(tk.Tk):
                 TICK = 0.25
                 step = ramp * TICK
                 self.after(0, lambda: status_lbl.configure(
-                    text=f"Ramping → {target:.4f}  ({ramp:.4f}/s) …", fg=AMBER))
+                    text=f"Ramping → {target_gauge:.4f} barg  ({ramp:.4f}/s) …", fg=AMBER))
                 while direction * (target - current) > 1e-6:
                     if stp.is_set():
                         self.after(0, lambda: status_lbl.configure(
@@ -2558,7 +2193,7 @@ class MASMonitor(tk.Tk):
                         text=f"Ramping… SP {v:.4f}", fg=AMBER))
                     time.sleep(TICK)
                 self.after(0, lambda: status_lbl.configure(
-                    text=f"Setpoint → {target:.4f} reached", fg=ACCENT))
+                    text=f"Setpoint → {target_gauge:.4f} barg reached", fg=ACCENT))
 
             t = threading.Thread(target=_do_ramp, daemon=True)
             ui["sp_ramp_thread"] = t
