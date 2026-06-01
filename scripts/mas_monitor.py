@@ -572,7 +572,7 @@ class MASMonitor(tk.Tk):
         self._live_redraw_job: str | None = None
 
         # Spin routine state
-        # Each step: (sp_A, sp_B, duration_seconds)
+        # Each step: (setpoint_barg, duration_seconds)
         self._spinup_steps:   list[tuple] = []
         self._spindown_steps: list[tuple] = []
         self._routine_thread: threading.Thread | None = None
@@ -1213,22 +1213,31 @@ class MASMonitor(tk.Tk):
         if df.empty:
             return df
 
-        f = df["frequency_hz"].values.copy()
+        f = df["frequency_hz"].values.astype(float).copy()
+
+        def _interp_nans(arr: np.ndarray) -> np.ndarray:
+            """Linear-interpolate over NaN gaps (needed before scipy filters,
+            which otherwise propagate NaN across the whole trace)."""
+            nans = np.isnan(arr)
+            if nans.any() and (~nans).any():
+                xs = np.arange(len(arr))
+                arr = arr.copy()
+                arr[nans] = np.interp(xs[nans], xs[~nans], arr[~nans])
+            return arr
 
         # ── Despiking ────────────────────────────────────────────────────────
         if self._despike_var.get():
             try:
                 thresh = float(self._despike_thresh_var.get())
-                median = np.median(f)
-                mad    = np.median(np.abs(f - median)) * 1.4826  # ≈ σ for Gaussian
+                # NaN-aware: real PicoScope logs contain NaN entries, which would
+                # otherwise make median/MAD NaN and silently disable despiking.
+                median = np.nanmedian(f)
+                mad    = np.nanmedian(np.abs(f - median)) * 1.4826  # ≈ σ for Gaussian
                 if mad > 0:
-                    mask   = np.abs(f - median) > thresh * mad
+                    mask = np.abs(f - median) > thresh * mad
+                    mask = np.where(np.isnan(mask), False, mask)
                     f[mask] = np.nan
-                    # Linear interpolation over NaN gaps
-                    nans = np.isnan(f)
-                    if nans.any() and (~nans).any():
-                        xs = np.arange(len(f))
-                        f  = np.interp(xs, xs[~nans], f[~nans])
+                    f = _interp_nans(f)
             except Exception:
                 pass
 
@@ -1251,7 +1260,7 @@ class MASMonitor(tk.Tk):
                 poly = min(3, n - 1)
                 wlen = n if n % 2 == 1 else n + 1   # must be odd
                 try:
-                    f = savgol_filter(f, window_length=wlen, polyorder=poly)
+                    f = savgol_filter(_interp_nans(f), window_length=wlen, polyorder=poly)
                 except Exception:
                     pass
             else:
@@ -1261,7 +1270,7 @@ class MASMonitor(tk.Tk):
         elif ftype == "Gaussian" and n > 1:
             if HAS_SCIPY:
                 sigma = n / 6.0   # n ≈ ±3σ full width
-                f = gaussian_filter1d(f, sigma=sigma)
+                f = gaussian_filter1d(_interp_nans(f), sigma=sigma)
             else:
                 f = pd.Series(f).rolling(n, min_periods=1, center=True).mean().values
 
@@ -1347,6 +1356,7 @@ class MASMonitor(tk.Tk):
         t = spin["timestamp"]
         f = spin["frequency_hz"] * mult
         mean_f, std_f = float(f.mean()), float(f.std())
+        rel_sigma = (std_f / mean_f) if mean_f else float("nan")
 
         if self._show_sigma_var.get():
             ax.fill_between(t, mean_f - std_f, mean_f + std_f,
@@ -1373,7 +1383,7 @@ class MASMonitor(tk.Tk):
 
         # Stats annotation
         ax.text(0.01, 0.97,
-                f"mean {mean_f:.4f} {unit}   σ {std_f:.4f} {unit}   σ/f {std_f/mean_f:.2e}",
+                f"mean {mean_f:.4f} {unit}   σ {std_f:.4f} {unit}   σ/f {rel_sigma:.2e}",
                 transform=ax.transAxes, fontsize=6.5, va="top", ha="left", color=FG_DIM)
 
         leg = ax.legend(loc="upper right", framealpha=0.25,
@@ -1838,7 +1848,7 @@ class MASMonitor(tk.Tk):
 
             hdr = tk.Frame(grp, bg=LFR_BG)
             hdr.pack(fill="x", padx=8, pady=(4, 0))
-            for txt, w in [("Step", 4), ("Setpoint (slm)", 14), ("Duration (s)", 12)]:
+            for txt, w in [("Step", 4), ("Setpoint (barg)", 14), ("Duration (s)", 12)]:
                 tk.Label(hdr, text=txt, bg=LFR_BG, fg=FG_DIM,
                          font=FONT_SM, anchor="w", width=w).pack(side="left", padx=(0, 4))
 
@@ -1921,6 +1931,12 @@ class MASMonitor(tk.Tk):
 
         tk.Label(win, text="Click  ✓ Save  in each panel to apply before running.",
                  bg=BG, fg=FG_DIM, font=FONT_SM, anchor="w").pack(fill="x", padx=12, pady=(2, 8))
+
+    @staticmethod
+    def _gauge_to_abs(gauge: float) -> float:
+        """Convert a gauge-pressure setpoint (barg) to the absolute value sent to
+        the device. SP <= 0 maps to 0.0 absolute so the valve fully closes."""
+        return 0.0 if gauge <= 0.0 else gauge + LOCAL_ATMOS
 
     def _routine_running(self) -> bool:
         return (self._routine_thread is not None
@@ -2026,25 +2042,28 @@ class MASMonitor(tk.Tk):
             return False
 
         n = len(steps)
-        prev_sp = steps[0][0] if steps else 0.0
-        # seed prev_sp from last known reading if available
+        # Step setpoints are entered as gauge (barg); the device works in absolute.
+        # Seed prev from the device's last (absolute) setpoint reading for a
+        # smooth initial ramp; otherwise start from the first step.
+        prev_abs = self._gauge_to_abs(steps[0][0]) if steps else 0.0
         if self._alicat and self._alicat.last_reading:
             try:
-                prev_sp = float(self._alicat.last_reading.get("setpoint", prev_sp))
+                prev_abs = float(self._alicat.last_reading.get("setpoint", prev_abs))
             except (TypeError, ValueError):
                 pass
 
-        for i, (sp, dur) in enumerate(steps):
+        for i, (sp_gauge, dur) in enumerate(steps):
             if self._routine_stop.is_set():
                 break
-            step_lbl = f"{label}  step {i+1}/{n}  →  SP {sp:.4f}"
+            target_abs = self._gauge_to_abs(sp_gauge)
+            step_lbl = f"{label}  step {i+1}/{n}  →  SP {sp_gauge:.4f} barg"
             self._routine_status = step_lbl + "  (ramping…)"
 
-            # Ramp to target setpoint
-            if _ramp_to(prev_sp, sp, step_lbl):
+            # Ramp to target setpoint (absolute values for the device)
+            if _ramp_to(prev_abs, target_abs, step_lbl):
                 self._routine_status = f"{label}  stopped at step {i+1}/{n}"
                 return
-            prev_sp = sp
+            prev_abs = target_abs
 
             # Hold at setpoint for dur seconds
             self._routine_status = f"{step_lbl}  ({dur:.0f} s hold)"
@@ -2135,7 +2154,7 @@ class MASMonitor(tk.Tk):
             # Device receives absolute = gauge + LOCAL_ATMOS.
             # SP = 0 is special: send 0.0 absolute → valve fully closed.
             target_gauge = float(ui["sp_entry_var"].get())
-            target = 0.0 if target_gauge <= 0.0 else target_gauge + LOCAL_ATMOS
+            target = self._gauge_to_abs(target_gauge)
         except ValueError:
             messagebox.showerror("Setpoint", "Enter a valid number.")
             return
@@ -2320,6 +2339,7 @@ class MASMonitor(tk.Tk):
 
         t, f = spin["timestamp"], spin["frequency_hz"] * mult
         mean_f, std_f = float(f.mean()), float(f.std())
+        rel_sigma = (std_f / mean_f) if mean_f else float("nan")
 
         if self._show_sigma_var.get():
             ax_f.fill_between(t, mean_f - std_f, mean_f + std_f,
@@ -2343,7 +2363,7 @@ class MASMonitor(tk.Tk):
             fontsize=9,
         )
         ax_f.text(0.01, 0.02,
-                  f"n={len(f):,}  mean={mean_f:.4f} {unit}  σ={std_f:.4f} {unit}  σ/f={std_f/mean_f:.2e}",
+                  f"n={len(f):,}  mean={mean_f:.4f} {unit}  σ={std_f:.4f} {unit}  σ/f={rel_sigma:.2e}",
                   transform=ax_f.transAxes, fontsize=6, va="bottom",
                   bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8, ec="lightgrey"))
         if ax_g is None:
