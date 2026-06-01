@@ -574,5 +574,11 @@ Tachometer/
 
 ---
 
+## License
+
+Released under the MIT License — see [`LICENSE`](LICENSE) for the full text.
+
+---
+
 *Built for optically-detected MAS NMR rotor monitoring. Runs fully offline; no data
 leaves your machine.*
