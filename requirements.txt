@@ -1,0 +1,13 @@
+# MAS Rotor Monitor — Python dependencies
+# Install with:  pip install -r requirements.txt
+# Requires Python 3.13+ (for Tk 9).
+
+matplotlib>=3.8
+pandas>=2.2
+numpy>=1.26
+pyserial>=3.5
+pyftdi>=0.55
+
+# Optional — enables the Savitzky-Golay and Gaussian smoothing filters.
+# The app runs without it (those two filters fall back to a rolling mean).
+scipy>=1.12

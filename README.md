@@ -111,8 +111,14 @@ Requires Python 3.13+ for Tk 9. On macOS, install it with Homebrew first
 
 ```bash
 /opt/homebrew/bin/python3.13 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+`requirements.txt` includes `scipy` (optional — it enables the Savitzky-Golay and
+Gaussian filters). If you'd rather skip it, install the core packages directly:
+
+```bash
 .venv/bin/pip install matplotlib pandas numpy pyserial pyftdi
-.venv/bin/pip install scipy          # optional — enables Savitzky-Golay / Gaussian filters
 ```
 
 On Linux/Windows, substitute your Python 3.13 interpreter path. The rest is identical.
@@ -572,6 +578,7 @@ Tachometer/
 │   └── alicat_probe.py       <- standalone serial diagnostics
 ├── examples/
 │   └── MeasurementLog*.csv   <- example PicoScope frequency log
+├── requirements.txt          <- pip dependencies
 ├── pyproject.toml
 └── README.md
 ```
