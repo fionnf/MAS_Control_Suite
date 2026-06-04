@@ -302,15 +302,17 @@ live readout tiles:
 
 **Setpoint convention** — you always enter setpoints as **gauge pressure (barg)**:
 
-| You enter | Result |
-|---|---|
-| `1` | 1 bar above atmosphere at the line output |
-| `0.21` | 0.21 bar above atmosphere |
-| `0` | valve fully closed |
+| You enter | Sent to device | Displayed back |
+|---|---|---|
+| `1` | `1.953` bar absolute | `1.000` barg |
+| `0.21` | `1.163` bar absolute | `0.210` barg |
+| `0` | `0.000` bar absolute | `0.000` (valve closed) |
 
-The Alicat is treated as a **gauge controller**, so the number you type is sent to the
-device unchanged — it is exactly the pressure above atmosphere you want at the output.
-`0` closes the valve. This same convention is used by the spin routines.
+The device measures and reports **absolute pressure** (includes atmosphere). The app
+adds `LOCAL_ATMOS` (≈ 0.953 bar for Zürich) before sending so the number you type is
+the gauge pressure above atmosphere. The display subtracts atmosphere back so both
+tiles always show the true gauge value. `0` sends 0 absolute to fully close the valve.
+This same convention is used by the spin routines.
 
 - **Set SP** — type a setpoint (barg) and press Enter or **Send**
 - **Ramp** — set a ramp rate (bar/s); 0 = instant. The app ramps the setpoint in
@@ -418,8 +420,8 @@ pressure_bar_B, temperature_C_B, vol_flow_slm_B, mass_flow_slm_B, setpoint_B, ga
 
 - `timestamp` — `YYYY-MM-DD HH:MM:SS.mmm` (local time, ms precision)
 - `freq_hz` — latest frequency reading from the loaded PicoScope CSV (Hz)
-- Alicat columns — **raw values as reported by the device**: pressure (bar gauge),
-  temperature (°C), volumetric and mass flow (slm), setpoint (bar gauge), gas name;
+- Alicat columns — **raw values as reported by the device**: pressure (bar absolute),
+  temperature (°C), volumetric and mass flow (slm), setpoint (bar absolute), gas name;
   empty if that unit is not connected
 - The file is flushed after every row and is safe to inspect while recording
 - Loading a unified file via **Load historical log** automatically extracts the
@@ -467,14 +469,14 @@ to change for your site:
 
 | Constant | Default | What it is |
 |---|---|---|
+| `LOCAL_ATMOS` | `0.953` | **Local atmospheric pressure in bar absolute.** Used to convert gauge setpoints → absolute (for sending) and absolute readings → gauge (for display). **Set this to your site's barometric pressure** (sea level ≈ `1.01325`; Zürich ~408 m ≈ `0.953`). |
 | `ALICAT_BAUD` | `19200` | Default baud rate selected in the UI |
 | `UNIT_MULTS` | — | Frequency unit conversions (`Hz`, `kHz`, `kRPM = Hz × 0.06`) |
 | `poll_hz` | `2.0` | Per-device serial polling rate (in `AlicatLogger.__init__`) |
-| `LOCAL_ATMOS` | `0.953` | Local atmospheric pressure (bar abs), informational only — the Alicat is treated as a gauge controller, so typed setpoints are sent unchanged. |
 
-> **Setpoints are gauge.** The number you type is the pressure above atmosphere you
-> want at the output and is sent to the Alicat unchanged; `0` closes the valve. No
-> atmospheric correction is applied.
+> **Why `LOCAL_ATMOS` matters:** if it is wrong, a typed setpoint of `1` will not
+> produce exactly 1 bar above your actual local atmosphere. Measure your local
+> barometric pressure in bar and update this constant.
 
 ---
 
@@ -543,8 +545,9 @@ It sends a 0 setpoint to fully close the valve. The 2-second hold prevents accid
 triggering — it's the emergency stop.
 
 **What units are setpoints in?**
-Gauge (barg). The number you type is the pressure above atmosphere you want at the
-output and is sent to the Alicat unchanged; `0` means "closed".
+You always type gauge (barg). The app converts to absolute (adds `LOCAL_ATMOS`) before
+sending to the device, and converts the device's absolute readback back to gauge for
+the display tiles. `0` always means "closed".
 
 **Can the second Alicat (B) drive the plots?**
 The time-series and scatter plots use Alicat A. Alicat B is still controlled, read,
@@ -557,8 +560,8 @@ and logged — it's just not the plotting source.
 | Term | Meaning |
 |---|---|
 | **MAS** | Magic-Angle Spinning — the rotor technique this monitors |
-| **barg** | Bar **gauge** — pressure relative to local atmosphere (what you type and what the controller works in) |
-| **bar absolute** | Pressure relative to vacuum |
+| **barg** | Bar **gauge** — pressure relative to local atmosphere (what you type and what is displayed) |
+| **bar absolute** | Pressure relative to vacuum (what the Alicat measures and accepts) |
 | **Drive / Bearing** | The two gas lines of a MAS probe: drive spins the rotor, bearing floats it |
 | **slm** | Standard litres per minute (mass-flow unit) |
 | **MAD** | Median Absolute Deviation — robust spread estimate used by the despiker |
