@@ -436,7 +436,7 @@ class AlicatLogger:
         )
 
     def set_gas(self, gas_id: int) -> None:
-        """Queue a gas-type change by integer ID (0=Air, 1=Ar, 2=CO₂, …)."""
+        """Queue a gas-type change by integer ID (0=Air, 1=Ar, 4=CO2, 8=N2, …)."""
         if not self.is_connected:
             raise RuntimeError("Not connected to Alicat.")
         self._queue(f"{self.address}$$G{gas_id:d}\r")
@@ -1031,12 +1031,14 @@ class MASMonitor(tk.Tk):
         sp_entry.bind("<Return>", lambda _, i=idx: self._send_setpoint(i))
         _btn(rs, "Send", lambda i=idx: self._send_setpoint(i)).pack(side="left", padx=(0, 8))
         _label2(rs, "Ramp:").pack(side="left")
-        ui["sp_ramp_var"] = tk.StringVar(value="0")
+        ui["sp_ramp_var"] = tk.StringVar(value="0.5")
         _entry(rs, ui["sp_ramp_var"], width=5).pack(side="left", padx=(4, 2))
         _label2(rs, "barg/s").pack(side="left", padx=(0, 8))
         _label2(rs, "Gas:").pack(side="left")
-        ui["gas_var"] = tk.StringVar(value="Air")
-        ALICAT_GASES = ["Air", "Ar", "CH₄", "CO", "CO₂", "C₂H₆", "H₂", "He", "N₂"]
+        ui["gas_var"] = tk.StringVar(value="N2")
+        # Plain-ASCII labels so every gas (incl. N2) renders regardless of the
+        # combobox font — Unicode subscripts can fail to display on some systems.
+        ALICAT_GASES = ["Air", "Ar", "CH4", "CO", "CO2", "C2H6", "H2", "He", "N2"]
         ui["gas_cb"] = _combo(rs, ui["gas_var"], ALICAT_GASES, width=6)
         ui["gas_cb"].pack(side="left", padx=(4, 0))
         ui["gas_cb"].bind("<<ComboboxSelected>>", lambda _, i=idx: self._send_gas(i))
@@ -2248,13 +2250,13 @@ class MASMonitor(tk.Tk):
     _GAS_IDS = {
         "Air":  0,
         "Ar":   1,
-        "CH₄":  2,
+        "CH4":  2,
         "CO":   3,
-        "CO₂":  4,
-        "C₂H₆": 5,
-        "H₂":   6,
+        "CO2":  4,
+        "C2H6": 5,
+        "H2":   6,
         "He":   7,
-        "N₂":   8,
+        "N2":   8,
     }
 
     def _send_gas(self, idx: int = 0):

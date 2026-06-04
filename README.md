@@ -445,7 +445,7 @@ carriage return (`\r`, **not** `\r\n`).
 | Poll a reading | `<addr>\r` | `A\r` |
 | Set setpoint | `<addr>S<value>\r` | `AS1.9530\r` |
 | Set device ramp rate | `<addr>SR<value>\r` | `ASR9999.0\r` |
-| Set gas by ID | `<addr>$$G<id>\r` | `A$$G8\r` (N₂) |
+| Set gas by ID | `<addr>$$G<id>\r` | `A$$G8\r` (N2) |
 
 **Serial parameters:** 8 data bits, no parity, 1 stop bit (8N1); baud as selected
 (default 19200); 1 s read/write timeout. The bus is polled at **2 Hz** per device.
@@ -454,9 +454,9 @@ carriage return (`\r`, **not** `\r\n`).
 
 | ID | Gas | ID | Gas | ID | Gas |
 |---|---|---|---|---|---|
-| 0 | Air | 3 | CO | 6 | H₂ |
-| 1 | Ar | 4 | CO₂ | 7 | He |
-| 2 | CH₄ | 5 | C₂H₆ | 8 | N₂ |
+| 0 | Air | 3 | CO | 6 | H2 |
+| 1 | Ar | 4 | CO2 | 7 | He |
+| 2 | CH4 | 5 | C2H6 | 8 | N2 |
 
 A typical Alicat streaming reply has the form
 `<addr> <pressure> <temp> <vol_flow> <mass_flow> <setpoint> <gas>` — the app maps
