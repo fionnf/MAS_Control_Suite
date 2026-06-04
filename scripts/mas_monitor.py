@@ -89,10 +89,10 @@ FONT_SM   = ("Helvetica Neue", 10)
 FONT_B    = ("Helvetica Neue", 11, "bold")
 
 # ── Constants ──────────────────────────────────────────────────────────────
-# Local atmospheric pressure for Zurich (~408 m altitude).
-# Used as the default gauge-zero reference so the display reads in barg.
-# "Zero P" sets offset → 0.0 (raw absolute) so SP=0 truly closes the valve.
-# "Clear offset" resets to this value.
+# Local atmospheric pressure for Zurich (~408 m altitude), in bar absolute.
+# Informational only: the Alicat is treated as a gauge controller, so typed
+# setpoints are the pressure above atmosphere and are sent through unchanged.
+# Kept for reference / future absolute-mode support.
 LOCAL_ATMOS    = 0.953   # bar absolute, Zurich
 
 APP_TITLE      = "MAS Rotor Monitor"
@@ -814,7 +814,7 @@ class MASMonitor(tk.Tk):
             if not self._alicat_ui[i]:
                 self._alicat_ui[i] = {}
             d = self._alicat_ui[i]
-            d.setdefault("pressure_offset", LOCAL_ATMOS)
+            d.setdefault("pressure_offset", 0.0)
             d.setdefault("sp_ramp_thread",  None)
             d.setdefault("sp_ramp_stop",    threading.Event())
             d.setdefault("valve_after_id",  None)
@@ -1046,9 +1046,8 @@ class MASMonitor(tk.Tk):
         rz = tk.Frame(cg, bg=LFR_BG); rz.pack(fill="x", padx=8, pady=(2, 2))
         _btn(rz, "Set Zero", lambda i=idx: self._set_zero_from_reading(i),
              bg="#1e2a3d").pack(side="left", padx=(0, 4))
-        _btn(rz, "Clear offset", lambda i=idx: self._clear_pressure_offset(i)).pack(side="left", padx=(0, 4))
-        _btn(rz, "Abs zero", lambda i=idx: self._zero_pressure(i), bg="#2a2a1e").pack(side="left", padx=(0, 8))
-        ui["pressure_offset"] = LOCAL_ATMOS
+        _btn(rz, "Clear offset", lambda i=idx: self._clear_pressure_offset(i)).pack(side="left", padx=(0, 8))
+        ui["pressure_offset"] = 0.0
         ui["zero_lbl"] = tk.Label(rz, text=f"offset: {ui['pressure_offset']:.5f} bar",
                                    bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
         ui["zero_lbl"].pack(side="left")
@@ -1412,9 +1411,9 @@ class MASMonitor(tk.Tk):
         # (dataframe, suffix, pressure_offset, linestyle)
         units = []
         if adf is not None and not adf.empty:
-            units.append((adf, "A", self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS), "-"))
+            units.append((adf, "A", self._alicat_ui[0].get("pressure_offset", 0.0), "-"))
         if adf_b is not None and not adf_b.empty:
-            units.append((adf_b, "B", self._alicat_ui[1].get("pressure_offset", LOCAL_ATMOS), "--"))
+            units.append((adf_b, "B", self._alicat_ui[1].get("pressure_offset", 0.0), "--"))
 
         handles = []
         any_pressure = any("pressure" in d.columns for d, *_ in units)
@@ -1472,7 +1471,7 @@ class MASMonitor(tk.Tk):
         x = merged["frequency_hz"] * mult
         y = pd.to_numeric(merged[col], errors="coerce")
         if col == "pressure":
-            y = y - self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS)
+            y = y - self._alicat_ui[0].get("pressure_offset", 0.0)
         mask = x.notna() & y.notna()
         if mask.sum() < 2:
             ax.text(0.5, 0.5, "Insufficient overlap", ha="center", va="center",
@@ -1677,8 +1676,8 @@ class MASMonitor(tk.Tk):
                 self._alicats[idx] = new_al
                 if idx == 0:
                     self._alicat = new_al
-                # Reset pressure offset on new connection
-                ui["pressure_offset"] = LOCAL_ATMOS
+                # Reset pressure tare on new connection (show true gauge reading)
+                ui["pressure_offset"] = 0.0
                 if ui.get("zero_lbl"):
                     ui["zero_lbl"].configure(
                         text=f"offset: {ui['pressure_offset']:.5f} bar", fg=FG_DIM)
@@ -1742,15 +1741,13 @@ class MASMonitor(tk.Tk):
         if not ui or not ui.get("ctl_p_lbl"):
             return
         al = self._alicats[idx]
-        offset = ui.get("pressure_offset", LOCAL_ATMOS)
+        offset = ui.get("pressure_offset", 0.0)
 
         def _fmt(key, decimals=3):
             try:
                 v = float(r[key])
-                if key == "pressure":
-                    v -= offset                         # user-adjustable gauge zero
-                elif key == "setpoint":
-                    v = 0.0 if v <= 0.0 else v - LOCAL_ATMOS   # fixed atm → barg; 0 = closed
+                if key in ("pressure", "setpoint"):
+                    v -= offset          # optional user tare (0 = true gauge reading)
                 return f"{v:.{decimals}f}"
             except (KeyError, ValueError, TypeError):
                 return "–"
@@ -1963,9 +1960,13 @@ class MASMonitor(tk.Tk):
 
     @staticmethod
     def _gauge_to_abs(gauge: float) -> float:
-        """Convert a gauge-pressure setpoint (barg) to the absolute value sent to
-        the device. SP <= 0 maps to 0.0 absolute so the valve fully closes."""
-        return 0.0 if gauge <= 0.0 else gauge + LOCAL_ATMOS
+        """Map a typed setpoint to the value sent to the device.
+
+        The Alicat is a **gauge** controller: the number you type is the pressure
+        above atmosphere (barg) you want at the line output, so it is sent through
+        unchanged. SP <= 0 is sent as 0.0 so the valve fully closes (no positive
+        pressure)."""
+        return 0.0 if gauge <= 0.0 else gauge
 
     def _routine_running(self) -> bool:
         return (self._routine_thread is not None
@@ -2133,20 +2134,12 @@ class MASMonitor(tk.Tk):
         self.after(250, self._poll_routine_status)
 
     def _clear_pressure_offset(self, idx: int = 0):
-        """Reset offset to local atmospheric (Zurich ~0.953 bar) for normal gauge display."""
-        ui = self._alicat_ui[idx]
-        ui["pressure_offset"] = LOCAL_ATMOS
-        ui["zero_lbl"].configure(
-            text=f"offset: {LOCAL_ATMOS:.5f} bar", fg=FG_DIM)
-        self._redraw()
-
-    def _zero_pressure(self, idx: int = 0):
-        """Set offset to 0.0 — display shows raw absolute pressure.
-        In this mode SP=0 sends a true absolute zero to the device (fully closes valve)."""
+        """Remove the display tare — the Pressure tile shows the device's true
+        gauge reading (offset = 0)."""
         ui = self._alicat_ui[idx]
         ui["pressure_offset"] = 0.0
         ui["zero_lbl"].configure(
-            text="offset: 0.00000 bar  (absolute mode)", fg=AMBER)
+            text="offset: 0.00000 bar", fg=FG_DIM)
         self._redraw()
 
     def _set_zero_from_reading(self, idx: int = 0):
@@ -2179,9 +2172,9 @@ class MASMonitor(tk.Tk):
             messagebox.showwarning("Alicat", "Not connected.")
             return
         try:
-            # User enters gauge pressure (barg).
-            # Device receives absolute = gauge + LOCAL_ATMOS.
-            # SP = 0 is special: send 0.0 absolute → valve fully closed.
+            # User enters gauge pressure (barg) — the pressure above atmosphere
+            # they want at the line output. The Alicat is a gauge controller, so
+            # this value is sent through unchanged. SP = 0 → 0 (valve closed).
             target_gauge = float(ui["sp_entry_var"].get())
             target = self._gauge_to_abs(target_gauge)
         except ValueError:
@@ -2414,9 +2407,9 @@ class MASMonitor(tk.Tk):
         if ax_g is not None:
             units = []
             if not alic.empty:
-                units.append((alic, "A", self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS), "-"))
+                units.append((alic, "A", self._alicat_ui[0].get("pressure_offset", 0.0), "-"))
             if not alic_b.empty:
-                units.append((alic_b, "B", self._alicat_ui[1].get("pressure_offset", LOCAL_ATMOS), "--"))
+                units.append((alic_b, "B", self._alicat_ui[1].get("pressure_offset", 0.0), "--"))
             multi = len(units) > 1
             any_pressure = any("pressure" in d.columns for d, *_ in units)
             any_flow     = any("mass_flow" in d.columns for d, *_ in units)
@@ -2456,7 +2449,7 @@ class MASMonitor(tk.Tk):
                     x = merged["frequency_hz"] * mult
                     y = pd.to_numeric(merged[col], errors="coerce")
                     if col == "pressure":
-                        y = y - self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS)
+                        y = y - self._alicat_ui[0].get("pressure_offset", 0.0)
                     mask = x.notna() & y.notna()
                     if mask.sum() >= 2:
                         idx = np.arange(mask.sum())
