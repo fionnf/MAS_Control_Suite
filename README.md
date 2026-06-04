@@ -244,8 +244,12 @@ The 4-panel view activates automatically when both spin and Alicat data are avai
 ```
 
 If only an Alicat is connected (no spin file loaded), a single pressure + flow panel
-is shown so you can monitor gas conditions immediately. Plots and scatter panels use
-**Alicat A** data.
+is shown so you can monitor gas conditions immediately.
+
+When **both** Alicats are connected, the pressure + flow panel shows both sensors
+together — Alicat A as **solid** lines and Alicat B as **dashed** lines, with a
+combined legend (Pressure A/B, Mass flow A/B). This applies to both the live view
+and exported plots. The scatter panels (Freq vs pressure / flow) use Alicat A.
 
 ---
 

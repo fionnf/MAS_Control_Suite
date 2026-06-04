@@ -1298,8 +1298,11 @@ class MASMonitor(tk.Tk):
         unit = self._unit_var.get()
         mult = UNIT_MULTS[unit]
         spin = self._get_spin_df()
-        adf  = self._get_alicat_df()
-        has_alic = not adf.empty
+        adf   = self._get_alicat_df(0)
+        adf_b = self._get_alicat_df(1)
+        has_alic = (not adf.empty) or (not adf_b.empty)
+        # Scatter panels use Alicat A; fall back to B if only B is present.
+        scat_df = adf if not adf.empty else adf_b
 
         self._fig.clear()
         self._fig.patch.set_facecolor(BG)
@@ -1330,8 +1333,8 @@ class MASMonitor(tk.Tk):
             ax_sc2  = self._fig.add_subplot(gs[1, 1])
 
             self._draw_freq(ax_freq, spin, unit, mult, xlabel=False)
-            self._draw_gas(ax_gas, adf)
-            merged = self._merge_for_scatter(spin, adf)
+            self._draw_gas(ax_gas, adf, adf_b)
+            merged = self._merge_for_scatter(spin, scat_df)
             self._draw_scatter(ax_sc1, merged, unit, mult, "pressure", C_PRESS, "Pressure")
             self._draw_scatter(ax_sc2, merged, unit, mult, "mass_flow", C_FLOW, "Mass flow")
 
@@ -1345,7 +1348,7 @@ class MASMonitor(tk.Tk):
             # ── Alicat only (no spin file) ──
             gs = self._fig.add_gridspec(1, 1, left=0.08, right=0.97, top=0.92, bottom=0.10)
             ax_gas = self._fig.add_subplot(gs[0, 0])
-            self._draw_gas(ax_gas, adf)
+            self._draw_gas(ax_gas, adf, adf_b)
 
         self._canvas.draw_idle()
 
@@ -1396,25 +1399,48 @@ class MASMonitor(tk.Tk):
             parts.append(f"+ {self._alicat_file_path.name}")
         ax.set_title("  ·  ".join(parts), fontsize=8, color=FG_DIM, pad=4)
 
-    def _draw_gas(self, ax, adf: pd.DataFrame):
+    def _draw_gas(self, ax, adf: pd.DataFrame, adf_b: pd.DataFrame | None = None):
+        """Pressure (left axis) and mass-flow (right axis) vs time.
+
+        Plots Alicat A as solid lines and, when connected, Alicat B as dashed
+        lines on the same axes so both sensors are visible together.
+        """
         _style_ax(ax)
-        ta = pd.to_datetime(adf["timestamp"])
+
+        # (dataframe, suffix, pressure_offset, linestyle)
+        units = []
+        if adf is not None and not adf.empty:
+            units.append((adf, "A", self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS), "-"))
+        if adf_b is not None and not adf_b.empty:
+            units.append((adf_b, "B", self._alicat_ui[1].get("pressure_offset", LOCAL_ATMOS), "--"))
 
         handles = []
-        if "pressure" in adf.columns:
-            _poff = self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS)
-            vals = pd.to_numeric(adf["pressure"], errors="coerce") - _poff
-            l, = ax.plot(ta, vals, lw=0.85, color=C_PRESS, label="Pressure")
-            handles.append(l)
-            ax.set_ylabel("Pressure (barg)", color=C_PRESS)
-            ax.tick_params(axis="y", labelcolor=C_PRESS)
+        any_pressure = any("pressure" in d.columns for d, *_ in units)
+        any_flow     = any("mass_flow" in d.columns for d, *_ in units)
+        multi        = len(units) > 1
 
-        if "mass_flow" in adf.columns:
+        ax2 = None
+        if any_flow:
             ax2 = ax.twinx()
             _style_ax(ax2, grid=False)
-            vals2 = pd.to_numeric(adf["mass_flow"], errors="coerce")
-            l2, = ax2.plot(ta, vals2, lw=0.85, color=C_FLOW, label="Mass flow")
-            handles.append(l2)
+
+        for d, sfx, poff, ls in units:
+            ta = pd.to_datetime(d["timestamp"])
+            if "pressure" in d.columns:
+                vals = pd.to_numeric(d["pressure"], errors="coerce") - poff
+                lbl = f"Pressure {sfx}" if multi else "Pressure"
+                l, = ax.plot(ta, vals, lw=0.85, color=C_PRESS, ls=ls, label=lbl)
+                handles.append(l)
+            if ax2 is not None and "mass_flow" in d.columns:
+                vals2 = pd.to_numeric(d["mass_flow"], errors="coerce")
+                lbl2 = f"Mass flow {sfx}" if multi else "Mass flow"
+                l2, = ax2.plot(ta, vals2, lw=0.85, color=C_FLOW, ls=ls, label=lbl2)
+                handles.append(l2)
+
+        if any_pressure:
+            ax.set_ylabel("Pressure (barg)", color=C_PRESS)
+            ax.tick_params(axis="y", labelcolor=C_PRESS)
+        if ax2 is not None:
             ax2.set_ylabel("Mass flow", color=C_FLOW)
             ax2.tick_params(axis="y", labelcolor=C_FLOW)
             ax2.spines["right"].set_edgecolor(C_FLOW)
@@ -1422,7 +1448,7 @@ class MASMonitor(tk.Tk):
         ax.set_xlabel("Time")
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
         _auto_rotate_xlabels(ax)
-        ax.spines["left"].set_edgecolor(C_PRESS if "pressure" in adf.columns else BORDER)
+        ax.spines["left"].set_edgecolor(C_PRESS if any_pressure else BORDER)
 
         if handles:
             ax.legend(handles=handles, loc="upper right", framealpha=0.25,
@@ -1474,18 +1500,19 @@ class MASMonitor(tk.Tk):
 
     # ── Alicat ─────────────────────────────────────────────────────────────
 
-    def _get_alicat_df(self) -> pd.DataFrame:
-        """Return the best available Alicat A dataset.
+    def _get_alicat_df(self, idx: int = 0) -> pd.DataFrame:
+        """Return the best available dataset for Alicat *idx* (0 = A, 1 = B).
 
         Priority: live serial data (if connected, even before logging starts)
-        → loaded historical file.
+        → loaded historical file (Alicat A only).
         """
-        al = self._alicats[0]
+        al = self._alicats[idx]
         if al.is_connected:
             live = al.get_dataframe()
             if not live.empty:
                 return live
-        return self._alicat_file_df
+        # Historical file loading only populates the Alicat A dataset.
+        return self._alicat_file_df if idx == 0 else pd.DataFrame()
 
     def _open_alicat_file(self):
         path = filedialog.askopenfilename(
@@ -2279,27 +2306,35 @@ class MASMonitor(tk.Tk):
             pass
 
     def _clipped(self):
-        spin = self._get_spin_df()
-        alic = self._get_alicat_df()
+        spin  = self._get_spin_df()
+        alic  = self._get_alicat_df(0)
+        alic_b = self._get_alicat_df(1)
         t0_s = self._t_from.get().strip()
         t1_s = self._t_to.get().strip()
+
+        def _clip(df, t, lower: bool):
+            if df.empty:
+                return df
+            ts = pd.to_datetime(df["timestamp"])
+            return df[ts >= t] if lower else df[ts <= t]
+
         try:
             if t0_s:
                 t0 = pd.Timestamp(t0_s)
-                spin = spin[spin["timestamp"] >= t0]
-                if not alic.empty:
-                    alic = alic[pd.to_datetime(alic["timestamp"]) >= t0]
+                spin   = _clip(spin,   t0, lower=True)
+                alic   = _clip(alic,   t0, lower=True)
+                alic_b = _clip(alic_b, t0, lower=True)
             if t1_s:
                 t1 = pd.Timestamp(t1_s)
-                spin = spin[spin["timestamp"] <= t1]
-                if not alic.empty:
-                    alic = alic[pd.to_datetime(alic["timestamp"]) <= t1]
+                spin   = _clip(spin,   t1, lower=False)
+                alic   = _clip(alic,   t1, lower=False)
+                alic_b = _clip(alic_b, t1, lower=False)
         except Exception as exc:
             messagebox.showerror("Time range", str(exc))
-        return spin, alic
+        return spin, alic, alic_b
 
     def _export_plot(self, fmt: str):
-        spin, alic = self._clipped()
+        spin, alic, alic_b = self._clipped()
         if spin.empty:
             messagebox.showwarning("Export", "No data in selected range.")
             return
@@ -2314,7 +2349,9 @@ class MASMonitor(tk.Tk):
         import matplotlib.pyplot as plt
         unit = self._unit_var.get()
         mult = UNIT_MULTS[unit]
-        has_alic = not alic.empty
+        has_alic = (not alic.empty) or (not alic_b.empty)
+        # Scatter panels use Alicat A; fall back to B if only B is present.
+        scat_df = alic if not alic.empty else alic_b
 
         if has_alic:
             fig = plt.figure(figsize=(10, 6), facecolor="white")
@@ -2373,23 +2410,40 @@ class MASMonitor(tk.Tk):
             ax_f.set_xticklabels([])
 
         if ax_g is not None:
-            ta = pd.to_datetime(alic["timestamp"])
-            if "pressure" in alic.columns:
-                ax_g.plot(ta,
-                          pd.to_numeric(alic["pressure"], errors="coerce") - self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS),
-                          lw=0.8, color=C_PRESS, label="Pressure")
+            units = []
+            if not alic.empty:
+                units.append((alic, "A", self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS), "-"))
+            if not alic_b.empty:
+                units.append((alic_b, "B", self._alicat_ui[1].get("pressure_offset", LOCAL_ATMOS), "--"))
+            multi = len(units) > 1
+            any_pressure = any("pressure" in d.columns for d, *_ in units)
+            any_flow     = any("mass_flow" in d.columns for d, *_ in units)
+            handles = []
+            axr = ax_g.twinx() if any_flow else None
+            for d, sfx, poff, ls in units:
+                ta = pd.to_datetime(d["timestamp"])
+                if "pressure" in d.columns:
+                    lbl = f"Pressure {sfx}" if multi else "Pressure"
+                    h, = ax_g.plot(ta,
+                              pd.to_numeric(d["pressure"], errors="coerce") - poff,
+                              lw=0.8, color=C_PRESS, ls=ls, label=lbl)
+                    handles.append(h)
+                if axr is not None and "mass_flow" in d.columns:
+                    lbl2 = f"Mass flow {sfx}" if multi else "Mass flow"
+                    h2, = axr.plot(ta, pd.to_numeric(d["mass_flow"], errors="coerce"),
+                             lw=0.8, color=C_FLOW, ls=ls, label=lbl2)
+                    handles.append(h2)
+            if any_pressure:
                 ax_g.set_ylabel("Pressure (barg)", color=C_PRESS)
-            if "mass_flow" in alic.columns:
-                axr = ax_g.twinx()
-                axr.plot(ta, pd.to_numeric(alic["mass_flow"], errors="coerce"),
-                         lw=0.8, color=C_FLOW, label="Mass flow")
+            if axr is not None:
                 axr.set_ylabel("Mass flow", color=C_FLOW)
             ax_g.set_xlabel("Time")
             ax_g.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
-            ax_g.legend(fontsize=7)
+            if handles:
+                ax_g.legend(handles=handles, fontsize=7)
             fig.autofmt_xdate(rotation=20)
 
-            merged = self._merge_for_scatter(spin, alic)
+            merged = self._merge_for_scatter(spin, scat_df)
             for ax_sc, col, colour, lbl in [
                 (ax_s1, "pressure",  C_PRESS, "Pressure"),
                 (ax_s2, "mass_flow", C_FLOW,  "Mass flow"),
@@ -2418,7 +2472,7 @@ class MASMonitor(tk.Tk):
         self._status(f"Plot saved → {Path(path).name}")
 
     def _export_csv(self):
-        spin, alic = self._clipped()
+        spin, alic, _alic_b = self._clipped()
         if spin.empty:
             messagebox.showwarning("Export", "No data in selected range.")
             return
