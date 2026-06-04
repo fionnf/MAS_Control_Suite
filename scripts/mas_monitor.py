@@ -89,10 +89,10 @@ FONT_SM   = ("Helvetica Neue", 10)
 FONT_B    = ("Helvetica Neue", 11, "bold")
 
 # ── Constants ──────────────────────────────────────────────────────────────
-# Local atmospheric pressure for Zurich (~408 m altitude).
-# Used as the default gauge-zero reference so the display reads in barg.
-# "Zero P" sets offset → 0.0 (raw absolute) so SP=0 truly closes the valve.
-# "Clear offset" resets to this value.
+# Local atmospheric pressure for Zurich (~408 m altitude), in bar absolute.
+# Informational only: the Alicat is treated as a gauge controller, so typed
+# setpoints are the pressure above atmosphere and are sent through unchanged.
+# Kept for reference / future absolute-mode support.
 LOCAL_ATMOS    = 0.953   # bar absolute, Zurich
 
 APP_TITLE      = "MAS Rotor Monitor"
@@ -436,7 +436,7 @@ class AlicatLogger:
         )
 
     def set_gas(self, gas_id: int) -> None:
-        """Queue a gas-type change by integer ID (0=Air, 1=Ar, 2=CO₂, …)."""
+        """Queue a gas-type change by integer ID (0=Air, 1=Ar, 4=CO2, 8=N2, …)."""
         if not self.is_connected:
             raise RuntimeError("Not connected to Alicat.")
         self._queue(f"{self.address}$$G{gas_id:d}\r")
@@ -572,7 +572,7 @@ class MASMonitor(tk.Tk):
         self._live_redraw_job: str | None = None
 
         # Spin routine state
-        # Each step: (sp_A, sp_B, duration_seconds)
+        # Each step: (setpoint_barg, duration_seconds)
         self._spinup_steps:   list[tuple] = []
         self._spindown_steps: list[tuple] = []
         self._routine_thread: threading.Thread | None = None
@@ -581,11 +581,6 @@ class MASMonitor(tk.Tk):
         self._routine_status = ""   # written by thread, read by UI tick
         self._ramp_rate_var  = tk.StringVar(value="0.1")   # barg/s; 0 = instant
 
-        # Frequency controller state
-        self._fc_thread:   threading.Thread | None = None
-        self._fc_stop      = threading.Event()
-        self._fc_status    = ""
-        self._fc_running   = False
 
         # ttk style overrides for comboboxes — keep default Aqua theme so that
         # tk.Button respects explicit bg colours; only restyle TCombobox fields.
@@ -819,7 +814,7 @@ class MASMonitor(tk.Tk):
             if not self._alicat_ui[i]:
                 self._alicat_ui[i] = {}
             d = self._alicat_ui[i]
-            d.setdefault("pressure_offset", LOCAL_ATMOS)
+            d.setdefault("pressure_offset", 0.0)
             d.setdefault("sp_ramp_thread",  None)
             d.setdefault("sp_ramp_stop",    threading.Event())
             d.setdefault("valve_after_id",  None)
@@ -971,91 +966,6 @@ class MASMonitor(tk.Tk):
             font=FONT_SM, anchor="w")
         self._routine_lbl.pack(fill="x", padx=8, pady=(2, 8))
 
-        # ── Frequency controller ──────────────────────────────────────────
-        fcg = _group(routine_tab, "Frequency Control  (feedback loop)")
-        fcg.pack(side="left", padx=(0, 10), fill="both", expand=True, pady=2)
-
-        # Mode selector
-        r = tk.Frame(fcg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(8, 4))
-        _label2(r, "Mode:").pack(side="left")
-        self._fc_mode_var = tk.StringVar(value="drive")
-        tk.Radiobutton(r, text="Drive only  (1 Alicat)", variable=self._fc_mode_var,
-            value="drive", bg=LFR_BG, fg=FG, font=FONT, selectcolor=BG_ENTRY,
-            activebackground=LFR_BG, activeforeground=FG,
-            command=self._fc_update_mode).pack(side="left", padx=(8, 16))
-        tk.Radiobutton(r, text="Drive + Bearing  (2 Alicats — Bruker sequence)",
-            variable=self._fc_mode_var, value="drive_bearing",
-            bg=LFR_BG, fg=FG, font=FONT, selectcolor=BG_ENTRY,
-            activebackground=LFR_BG, activeforeground=FG,
-            command=self._fc_update_mode).pack(side="left")
-
-        # Target + stability
-        r = tk.Frame(fcg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(2, 4))
-        _label2(r, "Target:").pack(side="left")
-        self._fc_target_var = tk.StringVar(value="50.0")
-        _entry(r, self._fc_target_var, width=9).pack(side="left", padx=(4, 2))
-        self._fc_target_unit_var = tk.StringVar(value="kHz")
-        _combo(r, self._fc_target_unit_var, ["Hz", "kHz", "kRPM"], width=6).pack(side="left", padx=(0, 16))
-        _label2(r, "Stability: last").pack(side="left")
-        self._fc_stab_n_var = tk.StringVar(value="20")
-        _entry(r, self._fc_stab_n_var, width=4).pack(side="left", padx=(4, 2))
-        _label2(r, "readings, σ <").pack(side="left", padx=(0, 4))
-        self._fc_stab_sigma_var = tk.StringVar(value="0.5")
-        _entry(r, self._fc_stab_sigma_var, width=5).pack(side="left", padx=(0, 2))
-        self._fc_stab_unit_var = tk.StringVar(value="kHz")
-        _combo(r, self._fc_stab_unit_var, ["Hz", "kHz", "kRPM"], width=6).pack(side="left")
-
-        # Per-Alicat limit panels (side by side)
-        param_row = tk.Frame(fcg, bg=LFR_BG); param_row.pack(fill="x", padx=8, pady=(4, 4))
-
-        def _fc_param_group(parent, title, pfx):
-            """Build min/max/start/gain fields; return dict of StringVars."""
-            fg2 = _group(parent, title)
-            fg2.pack(side="left", padx=(0, 12), fill="y")
-            d = {}
-            for lbl, key, defval in [
-                ("Min SP (bar):",   "min",   "0.0"),
-                ("Max SP (bar):",   "max",   "3.0"),
-                ("Start SP (bar):", "start", "0.5"),
-                ("Step (bar):",     "step",  "0.05"),
-                ("Gain (bar/kHz):", "gain",  "0.02"),
-            ]:
-                rr = tk.Frame(fg2, bg=LFR_BG); rr.pack(fill="x", padx=8, pady=1)
-                _label2(rr, lbl).pack(side="left")
-                v = tk.StringVar(value=defval)
-                _entry(rr, v, width=7).pack(side="left", padx=(4, 0))
-                d[key] = v
-            return fg2, d
-
-        drive_grp, self._fc_drive = _fc_param_group(param_row, "Drive  (Alicat A)", "A")
-        bear_grp,  self._fc_bear  = _fc_param_group(param_row, "Bearing  (Alicat B)", "B")
-        self._fc_bear_grp = bear_grp   # hidden in drive-only mode
-
-        # Wobble settings (bearing only)
-        wf = tk.Frame(bear_grp, bg=LFR_BG); wf.pack(fill="x", padx=8, pady=(4, 6))
-        _label2(wf, "Wobble Δ (bar):").pack(side="left")
-        self._fc_wobble_var = tk.StringVar(value="0.02")
-        _entry(wf, self._fc_wobble_var, width=6).pack(side="left", padx=(4, 8))
-        _label2(wf, "every (s):").pack(side="left")
-        self._fc_wobble_period_var = tk.StringVar(value="30")
-        _entry(wf, self._fc_wobble_period_var, width=5).pack(side="left", padx=(4, 0))
-
-        # Control row
-        r = tk.Frame(fcg, bg=LFR_BG); r.pack(fill="x", padx=8, pady=(4, 4))
-        self._fc_start_btn = _btn(r, "▶  Start frequency control", self._fc_toggle,
-                                  bg="#1e3d1e")
-        self._fc_start_btn.pack(side="left", padx=(0, 8))
-        self._fc_status_lbl = tk.Label(r, text="Idle", bg=LFR_BG, fg=FG_DIM,
-                                       font=FONT_SM, anchor="w")
-        self._fc_status_lbl.pack(side="left", fill="x", expand=True)
-
-        # Phase / step progress
-        self._fc_phase_lbl = tk.Label(fcg, text="", bg=LFR_BG, fg=ACCENT,
-                                      font=FONT_SM, anchor="w")
-        self._fc_phase_lbl.pack(fill="x", padx=8, pady=(0, 8))
-
-        self._fc_update_mode()   # hide bearing group if drive-only
-
         # Show Frequency tab by default
         _show_tab("Frequency")
 
@@ -1121,20 +1031,23 @@ class MASMonitor(tk.Tk):
         sp_entry.bind("<Return>", lambda _, i=idx: self._send_setpoint(i))
         _btn(rs, "Send", lambda i=idx: self._send_setpoint(i)).pack(side="left", padx=(0, 8))
         _label2(rs, "Ramp:").pack(side="left")
-        ui["sp_ramp_var"] = tk.StringVar(value="0")
+        ui["sp_ramp_var"] = tk.StringVar(value="0.5")
         _entry(rs, ui["sp_ramp_var"], width=5).pack(side="left", padx=(4, 2))
         _label2(rs, "barg/s").pack(side="left", padx=(0, 8))
         _label2(rs, "Gas:").pack(side="left")
-        ui["gas_var"] = tk.StringVar(value="Air")
-        ALICAT_GASES = ["Air", "Ar", "CH₄", "CO", "CO₂", "C₂H₆", "H₂", "He", "N₂"]
+        ui["gas_var"] = tk.StringVar(value="N2")
+        # Plain-ASCII labels so every gas (incl. N2) renders regardless of the
+        # combobox font — Unicode subscripts can fail to display on some systems.
+        ALICAT_GASES = ["Air", "Ar", "CH4", "CO", "CO2", "C2H6", "H2", "He", "N2"]
         ui["gas_cb"] = _combo(rs, ui["gas_var"], ALICAT_GASES, width=6)
         ui["gas_cb"].pack(side="left", padx=(4, 0))
         ui["gas_cb"].bind("<<ComboboxSelected>>", lambda _, i=idx: self._send_gas(i))
 
         rz = tk.Frame(cg, bg=LFR_BG); rz.pack(fill="x", padx=8, pady=(2, 2))
-        _btn(rz, "Zero P", lambda i=idx: self._zero_pressure(i), bg="#2a2a1e").pack(side="left", padx=(0, 4))
+        _btn(rz, "Set Zero", lambda i=idx: self._set_zero_from_reading(i),
+             bg="#1e2a3d").pack(side="left", padx=(0, 4))
         _btn(rz, "Clear offset", lambda i=idx: self._clear_pressure_offset(i)).pack(side="left", padx=(0, 8))
-        ui["pressure_offset"] = LOCAL_ATMOS
+        ui["pressure_offset"] = 0.0
         ui["zero_lbl"] = tk.Label(rz, text=f"offset: {ui['pressure_offset']:.5f} bar",
                                    bg=LFR_BG, fg=FG_DIM, font=FONT_SM, anchor="w")
         ui["zero_lbl"].pack(side="left")
@@ -1301,22 +1214,31 @@ class MASMonitor(tk.Tk):
         if df.empty:
             return df
 
-        f = df["frequency_hz"].values.copy()
+        f = df["frequency_hz"].values.astype(float).copy()
+
+        def _interp_nans(arr: np.ndarray) -> np.ndarray:
+            """Linear-interpolate over NaN gaps (needed before scipy filters,
+            which otherwise propagate NaN across the whole trace)."""
+            nans = np.isnan(arr)
+            if nans.any() and (~nans).any():
+                xs = np.arange(len(arr))
+                arr = arr.copy()
+                arr[nans] = np.interp(xs[nans], xs[~nans], arr[~nans])
+            return arr
 
         # ── Despiking ────────────────────────────────────────────────────────
         if self._despike_var.get():
             try:
                 thresh = float(self._despike_thresh_var.get())
-                median = np.median(f)
-                mad    = np.median(np.abs(f - median)) * 1.4826  # ≈ σ for Gaussian
+                # NaN-aware: real PicoScope logs contain NaN entries, which would
+                # otherwise make median/MAD NaN and silently disable despiking.
+                median = np.nanmedian(f)
+                mad    = np.nanmedian(np.abs(f - median)) * 1.4826  # ≈ σ for Gaussian
                 if mad > 0:
-                    mask   = np.abs(f - median) > thresh * mad
+                    mask = np.abs(f - median) > thresh * mad
+                    mask = np.where(np.isnan(mask), False, mask)
                     f[mask] = np.nan
-                    # Linear interpolation over NaN gaps
-                    nans = np.isnan(f)
-                    if nans.any() and (~nans).any():
-                        xs = np.arange(len(f))
-                        f  = np.interp(xs, xs[~nans], f[~nans])
+                    f = _interp_nans(f)
             except Exception:
                 pass
 
@@ -1339,7 +1261,7 @@ class MASMonitor(tk.Tk):
                 poly = min(3, n - 1)
                 wlen = n if n % 2 == 1 else n + 1   # must be odd
                 try:
-                    f = savgol_filter(f, window_length=wlen, polyorder=poly)
+                    f = savgol_filter(_interp_nans(f), window_length=wlen, polyorder=poly)
                 except Exception:
                     pass
             else:
@@ -1349,7 +1271,7 @@ class MASMonitor(tk.Tk):
         elif ftype == "Gaussian" and n > 1:
             if HAS_SCIPY:
                 sigma = n / 6.0   # n ≈ ±3σ full width
-                f = gaussian_filter1d(f, sigma=sigma)
+                f = gaussian_filter1d(_interp_nans(f), sigma=sigma)
             else:
                 f = pd.Series(f).rolling(n, min_periods=1, center=True).mean().values
 
@@ -1377,8 +1299,11 @@ class MASMonitor(tk.Tk):
         unit = self._unit_var.get()
         mult = UNIT_MULTS[unit]
         spin = self._get_spin_df()
-        adf  = self._get_alicat_df()
-        has_alic = not adf.empty
+        adf   = self._get_alicat_df(0)
+        adf_b = self._get_alicat_df(1)
+        has_alic = (not adf.empty) or (not adf_b.empty)
+        # Scatter panels use Alicat A; fall back to B if only B is present.
+        scat_df = adf if not adf.empty else adf_b
 
         self._fig.clear()
         self._fig.patch.set_facecolor(BG)
@@ -1409,8 +1334,8 @@ class MASMonitor(tk.Tk):
             ax_sc2  = self._fig.add_subplot(gs[1, 1])
 
             self._draw_freq(ax_freq, spin, unit, mult, xlabel=False)
-            self._draw_gas(ax_gas, adf)
-            merged = self._merge_for_scatter(spin, adf)
+            self._draw_gas(ax_gas, adf, adf_b)
+            merged = self._merge_for_scatter(spin, scat_df)
             self._draw_scatter(ax_sc1, merged, unit, mult, "pressure", C_PRESS, "Pressure")
             self._draw_scatter(ax_sc2, merged, unit, mult, "mass_flow", C_FLOW, "Mass flow")
 
@@ -1424,7 +1349,7 @@ class MASMonitor(tk.Tk):
             # ── Alicat only (no spin file) ──
             gs = self._fig.add_gridspec(1, 1, left=0.08, right=0.97, top=0.92, bottom=0.10)
             ax_gas = self._fig.add_subplot(gs[0, 0])
-            self._draw_gas(ax_gas, adf)
+            self._draw_gas(ax_gas, adf, adf_b)
 
         self._canvas.draw_idle()
 
@@ -1435,6 +1360,7 @@ class MASMonitor(tk.Tk):
         t = spin["timestamp"]
         f = spin["frequency_hz"] * mult
         mean_f, std_f = float(f.mean()), float(f.std())
+        rel_sigma = (std_f / mean_f) if mean_f else float("nan")
 
         if self._show_sigma_var.get():
             ax.fill_between(t, mean_f - std_f, mean_f + std_f,
@@ -1461,7 +1387,7 @@ class MASMonitor(tk.Tk):
 
         # Stats annotation
         ax.text(0.01, 0.97,
-                f"mean {mean_f:.4f} {unit}   σ {std_f:.4f} {unit}   σ/f {std_f/mean_f:.2e}",
+                f"mean {mean_f:.4f} {unit}   σ {std_f:.4f} {unit}   σ/f {rel_sigma:.2e}",
                 transform=ax.transAxes, fontsize=6.5, va="top", ha="left", color=FG_DIM)
 
         leg = ax.legend(loc="upper right", framealpha=0.25,
@@ -1474,25 +1400,48 @@ class MASMonitor(tk.Tk):
             parts.append(f"+ {self._alicat_file_path.name}")
         ax.set_title("  ·  ".join(parts), fontsize=8, color=FG_DIM, pad=4)
 
-    def _draw_gas(self, ax, adf: pd.DataFrame):
+    def _draw_gas(self, ax, adf: pd.DataFrame, adf_b: pd.DataFrame | None = None):
+        """Pressure (left axis) and mass-flow (right axis) vs time.
+
+        Plots Alicat A as solid lines and, when connected, Alicat B as dashed
+        lines on the same axes so both sensors are visible together.
+        """
         _style_ax(ax)
-        ta = pd.to_datetime(adf["timestamp"])
+
+        # (dataframe, suffix, pressure_offset, linestyle)
+        units = []
+        if adf is not None and not adf.empty:
+            units.append((adf, "A", self._alicat_ui[0].get("pressure_offset", 0.0), "-"))
+        if adf_b is not None and not adf_b.empty:
+            units.append((adf_b, "B", self._alicat_ui[1].get("pressure_offset", 0.0), "--"))
 
         handles = []
-        if "pressure" in adf.columns:
-            _poff = self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS)
-            vals = pd.to_numeric(adf["pressure"], errors="coerce") - _poff
-            l, = ax.plot(ta, vals, lw=0.85, color=C_PRESS, label="Pressure")
-            handles.append(l)
-            ax.set_ylabel("Pressure (barg)", color=C_PRESS)
-            ax.tick_params(axis="y", labelcolor=C_PRESS)
+        any_pressure = any("pressure" in d.columns for d, *_ in units)
+        any_flow     = any("mass_flow" in d.columns for d, *_ in units)
+        multi        = len(units) > 1
 
-        if "mass_flow" in adf.columns:
+        ax2 = None
+        if any_flow:
             ax2 = ax.twinx()
             _style_ax(ax2, grid=False)
-            vals2 = pd.to_numeric(adf["mass_flow"], errors="coerce")
-            l2, = ax2.plot(ta, vals2, lw=0.85, color=C_FLOW, label="Mass flow")
-            handles.append(l2)
+
+        for d, sfx, poff, ls in units:
+            ta = pd.to_datetime(d["timestamp"])
+            if "pressure" in d.columns:
+                vals = pd.to_numeric(d["pressure"], errors="coerce") - poff
+                lbl = f"Pressure {sfx}" if multi else "Pressure"
+                l, = ax.plot(ta, vals, lw=0.85, color=C_PRESS, ls=ls, label=lbl)
+                handles.append(l)
+            if ax2 is not None and "mass_flow" in d.columns:
+                vals2 = pd.to_numeric(d["mass_flow"], errors="coerce")
+                lbl2 = f"Mass flow {sfx}" if multi else "Mass flow"
+                l2, = ax2.plot(ta, vals2, lw=0.85, color=C_FLOW, ls=ls, label=lbl2)
+                handles.append(l2)
+
+        if any_pressure:
+            ax.set_ylabel("Pressure (barg)", color=C_PRESS)
+            ax.tick_params(axis="y", labelcolor=C_PRESS)
+        if ax2 is not None:
             ax2.set_ylabel("Mass flow", color=C_FLOW)
             ax2.tick_params(axis="y", labelcolor=C_FLOW)
             ax2.spines["right"].set_edgecolor(C_FLOW)
@@ -1500,7 +1449,7 @@ class MASMonitor(tk.Tk):
         ax.set_xlabel("Time")
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
         _auto_rotate_xlabels(ax)
-        ax.spines["left"].set_edgecolor(C_PRESS if "pressure" in adf.columns else BORDER)
+        ax.spines["left"].set_edgecolor(C_PRESS if any_pressure else BORDER)
 
         if handles:
             ax.legend(handles=handles, loc="upper right", framealpha=0.25,
@@ -1522,7 +1471,7 @@ class MASMonitor(tk.Tk):
         x = merged["frequency_hz"] * mult
         y = pd.to_numeric(merged[col], errors="coerce")
         if col == "pressure":
-            y = y - self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS)
+            y = y - self._alicat_ui[0].get("pressure_offset", 0.0)
         mask = x.notna() & y.notna()
         if mask.sum() < 2:
             ax.text(0.5, 0.5, "Insufficient overlap", ha="center", va="center",
@@ -1552,18 +1501,19 @@ class MASMonitor(tk.Tk):
 
     # ── Alicat ─────────────────────────────────────────────────────────────
 
-    def _get_alicat_df(self) -> pd.DataFrame:
-        """Return the best available Alicat A dataset.
+    def _get_alicat_df(self, idx: int = 0) -> pd.DataFrame:
+        """Return the best available dataset for Alicat *idx* (0 = A, 1 = B).
 
         Priority: live serial data (if connected, even before logging starts)
-        → loaded historical file.
+        → loaded historical file (Alicat A only).
         """
-        al = self._alicats[0]
+        al = self._alicats[idx]
         if al.is_connected:
             live = al.get_dataframe()
             if not live.empty:
                 return live
-        return self._alicat_file_df
+        # Historical file loading only populates the Alicat A dataset.
+        return self._alicat_file_df if idx == 0 else pd.DataFrame()
 
     def _open_alicat_file(self):
         path = filedialog.askopenfilename(
@@ -1726,8 +1676,8 @@ class MASMonitor(tk.Tk):
                 self._alicats[idx] = new_al
                 if idx == 0:
                     self._alicat = new_al
-                # Reset pressure offset on new connection
-                ui["pressure_offset"] = LOCAL_ATMOS
+                # Reset pressure tare on new connection (show true gauge reading)
+                ui["pressure_offset"] = 0.0
                 if ui.get("zero_lbl"):
                     ui["zero_lbl"].configure(
                         text=f"offset: {ui['pressure_offset']:.5f} bar", fg=FG_DIM)
@@ -1791,13 +1741,13 @@ class MASMonitor(tk.Tk):
         if not ui or not ui.get("ctl_p_lbl"):
             return
         al = self._alicats[idx]
-        offset = ui.get("pressure_offset", LOCAL_ATMOS)
+        offset = ui.get("pressure_offset", 0.0)
 
         def _fmt(key, decimals=3):
             try:
                 v = float(r[key])
                 if key in ("pressure", "setpoint"):
-                    v -= offset
+                    v -= offset          # optional user tare (0 = true gauge reading)
                 return f"{v:.{decimals}f}"
             except (KeyError, ValueError, TypeError):
                 return "–"
@@ -1899,309 +1849,6 @@ class MASMonitor(tk.Tk):
 
     # ── Spin routines ──────────────────────────────────────────────────────
 
-    # ── Frequency controller ───────────────────────────────────────────────
-
-    def _fc_update_mode(self):
-        """Show/hide the Bearing parameter group based on selected mode."""
-        if self._fc_mode_var.get() == "drive_bearing":
-            self._fc_bear_grp.pack(side="left", padx=(0, 12), fill="y")
-        else:
-            self._fc_bear_grp.pack_forget()
-
-    def _fc_get_latest_freq_hz(self) -> float | None:
-        """Return the single most-recent frequency reading in Hz, or None."""
-        if self._df.empty or "frequency_hz" not in self._df.columns:
-            return None
-        last = self._df["frequency_hz"].dropna()
-        return float(last.iloc[-1]) if not last.empty else None
-
-    def _fc_recent_freq_hz(self, n: int) -> "np.ndarray | None":
-        """Return the last *n* valid frequency readings as a numpy array, or None."""
-        if self._df.empty or "frequency_hz" not in self._df.columns:
-            return None
-        vals = self._df["frequency_hz"].dropna().values
-        if len(vals) == 0:
-            return None
-        return vals[-n:] if len(vals) >= n else vals
-
-    def _fc_is_stable(self) -> tuple[bool, str]:
-        """Check whether the current frequency reading is stable enough to engage."""
-        try:
-            n     = max(3, int(self._fc_stab_n_var.get()))
-            sigma = float(self._fc_stab_sigma_var.get())
-            unit  = self._fc_stab_unit_var.get()
-            sigma_hz = sigma / UNIT_MULTS.get(unit, 1.0)
-        except ValueError:
-            return False, "Bad stability parameters"
-
-        vals = self._fc_recent_freq_hz(n)
-        if vals is None or len(vals) < 3:
-            return False, "Not enough frequency readings"
-
-        std = float(np.std(vals))
-        cur = float(vals[-1])
-        cur_disp = cur * UNIT_MULTS.get(unit, 1.0)
-        std_disp = std * UNIT_MULTS.get(unit, 1.0)
-        if std > sigma_hz:
-            return False, (f"Unstable: σ = {std_disp:.3f} {unit}  "
-                           f"(need < {sigma:.3f})  @  {cur_disp:.3f} {unit}")
-        return True, f"Stable: σ = {std_disp:.3f} {unit}  @  {cur_disp:.3f} {unit}"
-
-    def _fc_toggle(self):
-        if self._fc_running:
-            self._fc_stop.set()
-            self._fc_start_btn.configure(text="▶  Start frequency control", bg="#1e3d1e")
-            self._fc_status_lbl.configure(text="Stopped", fg=FG_DIM)
-            self._fc_phase_lbl.configure(text="")
-            self._fc_running = False
-        else:
-            # Preflight checks
-            mode = self._fc_mode_var.get()
-            if not self._alicats[0].is_connected:
-                messagebox.showwarning("Freq control", "Alicat A (Drive) must be connected.")
-                return
-            if mode == "drive_bearing" and not self._alicats[1].is_connected:
-                messagebox.showwarning("Freq control", "Alicat B (Bearing) must be connected.")
-                return
-            stable, msg = self._fc_is_stable()
-            if not stable:
-                messagebox.showwarning("Freq control",
-                    f"Frequency reading not stable enough to engage.\n\n{msg}\n\n"
-                    "Check that PicoScope is logging and Auto-refresh is on.")
-                return
-            self._fc_stop.clear()
-            self._fc_running = True
-            self._fc_start_btn.configure(text="⏹  Stop", bg="#3d1e1e")
-            self._fc_status_lbl.configure(text="Starting…", fg=ACCENT)
-            self._fc_thread = threading.Thread(
-                target=self._fc_run_loop if mode == "drive" else self._fc_run_bruker,
-                daemon=True)
-            self._fc_thread.start()
-            self._fc_poll_status()
-
-    def _fc_poll_status(self):
-        """Called on the main thread every 500 ms while the controller is running."""
-        if not self._fc_running:
-            return
-        if self._fc_thread and not self._fc_thread.is_alive():
-            self._fc_running = False
-            self._fc_start_btn.configure(text="▶  Start frequency control", bg="#1e3d1e")
-            self._fc_status_lbl.configure(text=self._fc_status or "Finished", fg=FG_DIM)
-            self._fc_phase_lbl.configure(text="")
-            return
-        self._fc_status_lbl.configure(text=self._fc_status, fg=GREEN)
-        self.after(500, self._fc_poll_status)
-
-    def _fc_parse_drive(self) -> dict:
-        return {k: float(v.get()) for k, v in self._fc_drive.items()}
-
-    def _fc_parse_bear(self) -> dict:
-        return {k: float(v.get()) for k, v in self._fc_bear.items()}
-
-    def _fc_target_hz(self) -> float:
-        val  = float(self._fc_target_var.get())
-        unit = self._fc_target_unit_var.get()
-        return val / UNIT_MULTS.get(unit, 1.0)
-
-    def _fc_wait(self, seconds: float, phase: str) -> bool:
-        """Sleep in small ticks, updating _fc_status. Returns True if aborted."""
-        steps = max(1, int(seconds / 0.25))
-        for i in range(steps):
-            if self._fc_stop.is_set():
-                return True
-            self._fc_status = f"{phase}  ({(i+1)*0.25:.1f} / {seconds:.0f} s)"
-            time.sleep(0.25)
-        return False
-
-    def _fc_wait_stable(self, phase: str, timeout: float = 120.0) -> bool:
-        """Block until frequency is stable (or timeout). Returns True if aborted."""
-        t0 = time.time()
-        while not self._fc_stop.is_set():
-            if time.time() - t0 > timeout:
-                self._fc_status = f"{phase}  [timeout waiting for stability]"
-                return False
-            stable, msg = self._fc_is_stable()
-            self._fc_status = f"{phase}  |  {msg}"
-            if stable:
-                return True
-            time.sleep(0.5)
-        return False   # aborted
-
-    # ── Drive-only feedback loop ───────────────────────────────────────────
-
-    def _fc_run_loop(self):
-        """Simple proportional feedback on Alicat A (Drive only)."""
-        al    = self._alicats[0]
-        ui    = self._alicat_ui[0]
-        dp    = self._fc_parse_drive()
-        sp    = dp["start"]
-        offset = ui.get("pressure_offset", LOCAL_ATMOS)
-        TICK  = 1.0   # seconds between control updates
-
-        # Set initial setpoint
-        al.set_setpoint(sp + offset)
-        if self._fc_wait(3.0, "Applying initial drive SP"):
-            return
-
-        target_hz = self._fc_target_hz()
-
-        while not self._fc_stop.is_set():
-            # Wait for stable reading
-            if not self._fc_wait_stable("Waiting for stability", timeout=60.0):
-                if self._fc_stop.is_set():
-                    return
-                # proceed anyway after timeout
-
-            freq = self._fc_get_latest_freq_hz()
-            if freq is None:
-                self._fc_status = "No frequency reading — check PicoScope"
-                time.sleep(TICK)
-                continue
-
-            error_hz  = target_hz - freq
-            error_unit = error_hz * UNIT_MULTS.get(self._fc_target_unit_var.get(), 1.0)
-            unit_lbl   = self._fc_target_unit_var.get()
-            delta      = dp["gain"] * error_hz * UNIT_MULTS.get("kHz", 1.0)   # gain is bar/kHz
-            sp_new     = sp + delta
-            sp_new     = max(dp["min"], min(dp["max"], sp_new))
-
-            self._fc_status = (f"Drive SP {sp:.4f} barg  |  "
-                               f"freq {freq * UNIT_MULTS.get(unit_lbl,1):.3f} {unit_lbl}  |  "
-                               f"error {error_unit:+.3f} {unit_lbl}")
-
-            if abs(sp_new - sp) > 1e-5:
-                sp = sp_new
-                al.set_setpoint(sp + offset)
-
-            time.sleep(TICK)
-
-        self._fc_status = "Drive control stopped"
-
-    # ── Bruker-style Drive + Bearing feedback loop ─────────────────────────
-
-    def _fc_run_bruker(self):
-        """
-        Bruker-style spin-up and frequency control with drive + bearing.
-
-        Sequence:
-          Phase 1 — Apply bearing: ramp bearing to start SP, wait for stability.
-          Phase 2 — Apply drive:   ramp drive to start SP, wait for rotor to spin.
-          Phase 3 — Frequency control loop:
-                      • Proportional correction on drive to hit target frequency.
-                      • Periodic bearing wobble (hill-climb on frequency stability)
-                        to find the optimal bearing pressure.
-        """
-        al_d   = self._alicats[0]   # Drive  — Alicat A
-        al_b   = self._alicats[1]   # Bearing — Alicat B
-        ui_d   = self._alicat_ui[0]
-        ui_b   = self._alicat_ui[1]
-        dp     = self._fc_parse_drive()
-        bp     = self._fc_parse_bear()
-        off_d  = ui_d.get("pressure_offset", LOCAL_ATMOS)
-        off_b  = ui_b.get("pressure_offset", LOCAL_ATMOS)
-
-        try:
-            wobble_delta  = float(self._fc_wobble_var.get())
-            wobble_period = float(self._fc_wobble_period_var.get())
-        except ValueError:
-            wobble_delta, wobble_period = 0.02, 30.0
-
-        TICK = 1.0
-
-        def _set_phase(txt):
-            self._fc_status = txt
-
-        # ── Phase 1: Bearing ───────────────────────────────────────────────
-        _set_phase("Phase 1 — Setting bearing pressure")
-        bear_sp = bp["start"]
-        al_b.set_setpoint(bear_sp + off_b)
-        if self._fc_wait(5.0, "Phase 1 — Bearing settling"):
-            return
-
-        # Wait for stable reading (bearing only, rotor may not be spinning yet)
-        _set_phase("Phase 1 — Waiting for bearing stability")
-        time.sleep(3.0)   # short grace period before checking stability
-
-        # ── Phase 2: Drive ─────────────────────────────────────────────────
-        _set_phase("Phase 2 — Applying drive pressure")
-        drive_sp = dp["start"]
-        al_d.set_setpoint(drive_sp + off_d)
-
-        # Wait until rotor starts spinning (frequency appears above noise floor)
-        _set_phase("Phase 2 — Waiting for rotor to spin")
-        spin_timeout = 120.0
-        t0 = time.time()
-        target_hz = self._fc_target_hz()
-        while not self._fc_stop.is_set():
-            freq = self._fc_get_latest_freq_hz()
-            if freq and freq > target_hz * 0.05:   # > 5 % of target
-                break
-            if time.time() - t0 > spin_timeout:
-                _set_phase("Phase 2 — Rotor did not spin up within timeout; continuing")
-                break
-            self._fc_status = (f"Phase 2 — Waiting for spin  |  "
-                               f"freq {(freq or 0) / 1000:.2f} kHz")
-            time.sleep(0.5)
-        if self._fc_stop.is_set():
-            return
-
-        # ── Phase 3: Feedback loop ─────────────────────────────────────────
-        last_wobble_t  = time.time()
-        bear_dir       = +1   # wobble search direction
-        bear_baseline_std = None
-
-        while not self._fc_stop.is_set():
-            freq = self._fc_get_latest_freq_hz()
-            if freq is None:
-                self._fc_status = "Phase 3 — No frequency reading"
-                time.sleep(TICK)
-                continue
-
-            unit_lbl  = self._fc_target_unit_var.get()
-            mult      = UNIT_MULTS.get(unit_lbl, 1.0)
-            error_hz  = target_hz - freq
-            delta     = dp["gain"] * error_hz * 1e-3   # gain is bar/kHz, error in Hz → /1000
-            new_d_sp  = max(dp["min"], min(dp["max"], drive_sp + delta))
-
-            self._fc_status = (f"Phase 3 — Drive {drive_sp:.4f} barg  |  "
-                               f"Bear {bear_sp:.4f} barg  |  "
-                               f"freq {freq * mult:.3f} {unit_lbl}  |  "
-                               f"err {error_hz * mult:+.3f} {unit_lbl}")
-
-            if abs(new_d_sp - drive_sp) > 1e-5:
-                drive_sp = new_d_sp
-                al_d.set_setpoint(drive_sp + off_d)
-
-            # ── Bearing wobble (hill-climb on σ) ──────────────────────────
-            now = time.time()
-            if now - last_wobble_t >= wobble_period:
-                last_wobble_t = now
-
-                # measure baseline σ
-                vals0  = self._fc_recent_freq_hz(10)
-                std0   = float(np.std(vals0)) if vals0 is not None and len(vals0) >= 3 else 1e9
-
-                # try a step in current direction
-                cand = max(bp["min"], min(bp["max"], bear_sp + bear_dir * wobble_delta))
-                al_b.set_setpoint(cand + off_b)
-                time.sleep(3.0)
-                if self._fc_stop.is_set():
-                    return
-                vals1 = self._fc_recent_freq_hz(10)
-                std1  = float(np.std(vals1)) if vals1 is not None and len(vals1) >= 3 else 1e9
-
-                if std1 <= std0:
-                    # improvement — accept and continue in same direction
-                    bear_sp = cand
-                else:
-                    # worse — revert and flip direction
-                    al_b.set_setpoint(bear_sp + off_b)
-                    bear_dir *= -1
-
-            time.sleep(TICK)
-
-        self._fc_status = "Drive + Bearing control stopped"
-
     # ── Spin routines ──────────────────────────────────────────────────────
 
     def _open_routine_editor(self):
@@ -2227,7 +1874,7 @@ class MASMonitor(tk.Tk):
 
             hdr = tk.Frame(grp, bg=LFR_BG)
             hdr.pack(fill="x", padx=8, pady=(4, 0))
-            for txt, w in [("Step", 4), ("Setpoint (slm)", 14), ("Duration (s)", 12)]:
+            for txt, w in [("Step", 4), ("Setpoint (barg)", 14), ("Duration (s)", 12)]:
                 tk.Label(hdr, text=txt, bg=LFR_BG, fg=FG_DIM,
                          font=FONT_SM, anchor="w", width=w).pack(side="left", padx=(0, 4))
 
@@ -2310,6 +1957,16 @@ class MASMonitor(tk.Tk):
 
         tk.Label(win, text="Click  ✓ Save  in each panel to apply before running.",
                  bg=BG, fg=FG_DIM, font=FONT_SM, anchor="w").pack(fill="x", padx=12, pady=(2, 8))
+
+    @staticmethod
+    def _gauge_to_abs(gauge: float) -> float:
+        """Map a typed setpoint to the value sent to the device.
+
+        The Alicat is a **gauge** controller: the number you type is the pressure
+        above atmosphere (barg) you want at the line output, so it is sent through
+        unchanged. SP <= 0 is sent as 0.0 so the valve fully closes (no positive
+        pressure)."""
+        return 0.0 if gauge <= 0.0 else gauge
 
     def _routine_running(self) -> bool:
         return (self._routine_thread is not None
@@ -2415,25 +2072,28 @@ class MASMonitor(tk.Tk):
             return False
 
         n = len(steps)
-        prev_sp = steps[0][0] if steps else 0.0
-        # seed prev_sp from last known reading if available
+        # Step setpoints are entered as gauge (barg); the device works in absolute.
+        # Seed prev from the device's last (absolute) setpoint reading for a
+        # smooth initial ramp; otherwise start from the first step.
+        prev_abs = self._gauge_to_abs(steps[0][0]) if steps else 0.0
         if self._alicat and self._alicat.last_reading:
             try:
-                prev_sp = float(self._alicat.last_reading.get("setpoint", prev_sp))
+                prev_abs = float(self._alicat.last_reading.get("setpoint", prev_abs))
             except (TypeError, ValueError):
                 pass
 
-        for i, (sp, dur) in enumerate(steps):
+        for i, (sp_gauge, dur) in enumerate(steps):
             if self._routine_stop.is_set():
                 break
-            step_lbl = f"{label}  step {i+1}/{n}  →  SP {sp:.4f}"
+            target_abs = self._gauge_to_abs(sp_gauge)
+            step_lbl = f"{label}  step {i+1}/{n}  →  SP {sp_gauge:.4f} barg"
             self._routine_status = step_lbl + "  (ramping…)"
 
-            # Ramp to target setpoint
-            if _ramp_to(prev_sp, sp, step_lbl):
+            # Ramp to target setpoint (absolute values for the device)
+            if _ramp_to(prev_abs, target_abs, step_lbl):
                 self._routine_status = f"{label}  stopped at step {i+1}/{n}"
                 return
-            prev_sp = sp
+            prev_abs = target_abs
 
             # Hold at setpoint for dur seconds
             self._routine_status = f"{step_lbl}  ({dur:.0f} s hold)"
@@ -2474,20 +2134,35 @@ class MASMonitor(tk.Tk):
         self.after(250, self._poll_routine_status)
 
     def _clear_pressure_offset(self, idx: int = 0):
-        """Reset offset to local atmospheric (Zurich ~0.953 bar) for normal gauge display."""
-        ui = self._alicat_ui[idx]
-        ui["pressure_offset"] = LOCAL_ATMOS
-        ui["zero_lbl"].configure(
-            text=f"offset: {LOCAL_ATMOS:.5f} bar", fg=FG_DIM)
-        self._redraw()
-
-    def _zero_pressure(self, idx: int = 0):
-        """Set offset to 0.0 — display shows raw absolute pressure.
-        In this mode SP=0 sends a true absolute zero to the device (fully closes valve)."""
+        """Remove the display tare — the Pressure tile shows the device's true
+        gauge reading (offset = 0)."""
         ui = self._alicat_ui[idx]
         ui["pressure_offset"] = 0.0
         ui["zero_lbl"].configure(
-            text="offset: 0.00000 bar  (absolute mode)", fg=AMBER)
+            text="offset: 0.00000 bar", fg=FG_DIM)
+        self._redraw()
+
+    def _set_zero_from_reading(self, idx: int = 0):
+        """Capture the current live pressure reading as the gauge zero.
+        After this the display reads 0 at the current applied pressure."""
+        ui = self._alicat_ui[idx]
+        al = self._alicats[idx]
+        r  = al.last_reading if al.is_connected else None
+        if not r:
+            messagebox.showwarning(
+                f"Alicat {'A' if idx == 0 else 'B'}",
+                "No live reading available — connect the Alicat first.")
+            return
+        try:
+            raw = float(r["pressure"])
+        except (KeyError, ValueError, TypeError):
+            messagebox.showwarning(
+                f"Alicat {'A' if idx == 0 else 'B'}",
+                "Could not read current pressure.")
+            return
+        ui["pressure_offset"] = raw
+        ui["zero_lbl"].configure(
+            text=f"offset: {raw:.5f} bar  (zeroed at reading)", fg=GREEN)
         self._redraw()
 
     def _send_setpoint(self, idx: int = 0):
@@ -2497,10 +2172,11 @@ class MASMonitor(tk.Tk):
             messagebox.showwarning("Alicat", "Not connected.")
             return
         try:
-            # User enters gauge value; add offset to get absolute for the device
+            # User enters gauge pressure (barg) — the pressure above atmosphere
+            # they want at the line output. The Alicat is a gauge controller, so
+            # this value is sent through unchanged. SP = 0 → 0 (valve closed).
             target_gauge = float(ui["sp_entry_var"].get())
-            offset       = ui.get("pressure_offset", LOCAL_ATMOS)
-            target       = target_gauge + offset
+            target = self._gauge_to_abs(target_gauge)
         except ValueError:
             messagebox.showerror("Setpoint", "Enter a valid number.")
             return
@@ -2522,7 +2198,7 @@ class MASMonitor(tk.Tk):
         if ramp <= 0.0:
             try:
                 al.set_setpoint(target)
-                status_lbl.configure(text=f"Setpoint → {target:.4f} sent", fg=ACCENT)
+                status_lbl.configure(text=f"Setpoint → {target_gauge:.4f} barg sent", fg=ACCENT)
             except Exception as exc:
                 messagebox.showerror("Setpoint", str(exc))
         else:
@@ -2539,7 +2215,7 @@ class MASMonitor(tk.Tk):
                 TICK = 0.25
                 step = ramp * TICK
                 self.after(0, lambda: status_lbl.configure(
-                    text=f"Ramping → {target:.4f}  ({ramp:.4f}/s) …", fg=AMBER))
+                    text=f"Ramping → {target_gauge:.4f} barg  ({ramp:.4f}/s) …", fg=AMBER))
                 while direction * (target - current) > 1e-6:
                     if stp.is_set():
                         self.after(0, lambda: status_lbl.configure(
@@ -2558,7 +2234,7 @@ class MASMonitor(tk.Tk):
                         text=f"Ramping… SP {v:.4f}", fg=AMBER))
                     time.sleep(TICK)
                 self.after(0, lambda: status_lbl.configure(
-                    text=f"Setpoint → {target:.4f} reached", fg=ACCENT))
+                    text=f"Setpoint → {target_gauge:.4f} barg reached", fg=ACCENT))
 
             t = threading.Thread(target=_do_ramp, daemon=True)
             ui["sp_ramp_thread"] = t
@@ -2567,13 +2243,13 @@ class MASMonitor(tk.Tk):
     _GAS_IDS = {
         "Air":  0,
         "Ar":   1,
-        "CH₄":  2,
+        "CH4":  2,
         "CO":   3,
-        "CO₂":  4,
-        "C₂H₆": 5,
-        "H₂":   6,
+        "CO2":  4,
+        "C2H6": 5,
+        "H2":   6,
         "He":   7,
-        "N₂":   8,
+        "N2":   8,
     }
 
     def _send_gas(self, idx: int = 0):
@@ -2625,27 +2301,35 @@ class MASMonitor(tk.Tk):
             pass
 
     def _clipped(self):
-        spin = self._get_spin_df()
-        alic = self._get_alicat_df()
+        spin  = self._get_spin_df()
+        alic  = self._get_alicat_df(0)
+        alic_b = self._get_alicat_df(1)
         t0_s = self._t_from.get().strip()
         t1_s = self._t_to.get().strip()
+
+        def _clip(df, t, lower: bool):
+            if df.empty:
+                return df
+            ts = pd.to_datetime(df["timestamp"])
+            return df[ts >= t] if lower else df[ts <= t]
+
         try:
             if t0_s:
                 t0 = pd.Timestamp(t0_s)
-                spin = spin[spin["timestamp"] >= t0]
-                if not alic.empty:
-                    alic = alic[pd.to_datetime(alic["timestamp"]) >= t0]
+                spin   = _clip(spin,   t0, lower=True)
+                alic   = _clip(alic,   t0, lower=True)
+                alic_b = _clip(alic_b, t0, lower=True)
             if t1_s:
                 t1 = pd.Timestamp(t1_s)
-                spin = spin[spin["timestamp"] <= t1]
-                if not alic.empty:
-                    alic = alic[pd.to_datetime(alic["timestamp"]) <= t1]
+                spin   = _clip(spin,   t1, lower=False)
+                alic   = _clip(alic,   t1, lower=False)
+                alic_b = _clip(alic_b, t1, lower=False)
         except Exception as exc:
             messagebox.showerror("Time range", str(exc))
-        return spin, alic
+        return spin, alic, alic_b
 
     def _export_plot(self, fmt: str):
-        spin, alic = self._clipped()
+        spin, alic, alic_b = self._clipped()
         if spin.empty:
             messagebox.showwarning("Export", "No data in selected range.")
             return
@@ -2660,7 +2344,9 @@ class MASMonitor(tk.Tk):
         import matplotlib.pyplot as plt
         unit = self._unit_var.get()
         mult = UNIT_MULTS[unit]
-        has_alic = not alic.empty
+        has_alic = (not alic.empty) or (not alic_b.empty)
+        # Scatter panels use Alicat A; fall back to B if only B is present.
+        scat_df = alic if not alic.empty else alic_b
 
         if has_alic:
             fig = plt.figure(figsize=(10, 6), facecolor="white")
@@ -2685,6 +2371,7 @@ class MASMonitor(tk.Tk):
 
         t, f = spin["timestamp"], spin["frequency_hz"] * mult
         mean_f, std_f = float(f.mean()), float(f.std())
+        rel_sigma = (std_f / mean_f) if mean_f else float("nan")
 
         if self._show_sigma_var.get():
             ax_f.fill_between(t, mean_f - std_f, mean_f + std_f,
@@ -2708,7 +2395,7 @@ class MASMonitor(tk.Tk):
             fontsize=9,
         )
         ax_f.text(0.01, 0.02,
-                  f"n={len(f):,}  mean={mean_f:.4f} {unit}  σ={std_f:.4f} {unit}  σ/f={std_f/mean_f:.2e}",
+                  f"n={len(f):,}  mean={mean_f:.4f} {unit}  σ={std_f:.4f} {unit}  σ/f={rel_sigma:.2e}",
                   transform=ax_f.transAxes, fontsize=6, va="bottom",
                   bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8, ec="lightgrey"))
         if ax_g is None:
@@ -2718,23 +2405,40 @@ class MASMonitor(tk.Tk):
             ax_f.set_xticklabels([])
 
         if ax_g is not None:
-            ta = pd.to_datetime(alic["timestamp"])
-            if "pressure" in alic.columns:
-                ax_g.plot(ta,
-                          pd.to_numeric(alic["pressure"], errors="coerce") - self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS),
-                          lw=0.8, color=C_PRESS, label="Pressure")
+            units = []
+            if not alic.empty:
+                units.append((alic, "A", self._alicat_ui[0].get("pressure_offset", 0.0), "-"))
+            if not alic_b.empty:
+                units.append((alic_b, "B", self._alicat_ui[1].get("pressure_offset", 0.0), "--"))
+            multi = len(units) > 1
+            any_pressure = any("pressure" in d.columns for d, *_ in units)
+            any_flow     = any("mass_flow" in d.columns for d, *_ in units)
+            handles = []
+            axr = ax_g.twinx() if any_flow else None
+            for d, sfx, poff, ls in units:
+                ta = pd.to_datetime(d["timestamp"])
+                if "pressure" in d.columns:
+                    lbl = f"Pressure {sfx}" if multi else "Pressure"
+                    h, = ax_g.plot(ta,
+                              pd.to_numeric(d["pressure"], errors="coerce") - poff,
+                              lw=0.8, color=C_PRESS, ls=ls, label=lbl)
+                    handles.append(h)
+                if axr is not None and "mass_flow" in d.columns:
+                    lbl2 = f"Mass flow {sfx}" if multi else "Mass flow"
+                    h2, = axr.plot(ta, pd.to_numeric(d["mass_flow"], errors="coerce"),
+                             lw=0.8, color=C_FLOW, ls=ls, label=lbl2)
+                    handles.append(h2)
+            if any_pressure:
                 ax_g.set_ylabel("Pressure (barg)", color=C_PRESS)
-            if "mass_flow" in alic.columns:
-                axr = ax_g.twinx()
-                axr.plot(ta, pd.to_numeric(alic["mass_flow"], errors="coerce"),
-                         lw=0.8, color=C_FLOW, label="Mass flow")
+            if axr is not None:
                 axr.set_ylabel("Mass flow", color=C_FLOW)
             ax_g.set_xlabel("Time")
             ax_g.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
-            ax_g.legend(fontsize=7)
+            if handles:
+                ax_g.legend(handles=handles, fontsize=7)
             fig.autofmt_xdate(rotation=20)
 
-            merged = self._merge_for_scatter(spin, alic)
+            merged = self._merge_for_scatter(spin, scat_df)
             for ax_sc, col, colour, lbl in [
                 (ax_s1, "pressure",  C_PRESS, "Pressure"),
                 (ax_s2, "mass_flow", C_FLOW,  "Mass flow"),
@@ -2745,7 +2449,7 @@ class MASMonitor(tk.Tk):
                     x = merged["frequency_hz"] * mult
                     y = pd.to_numeric(merged[col], errors="coerce")
                     if col == "pressure":
-                        y = y - self._alicat_ui[0].get("pressure_offset", LOCAL_ATMOS)
+                        y = y - self._alicat_ui[0].get("pressure_offset", 0.0)
                     mask = x.notna() & y.notna()
                     if mask.sum() >= 2:
                         idx = np.arange(mask.sum())
@@ -2763,7 +2467,7 @@ class MASMonitor(tk.Tk):
         self._status(f"Plot saved → {Path(path).name}")
 
     def _export_csv(self):
-        spin, alic = self._clipped()
+        spin, alic, _alic_b = self._clipped()
         if spin.empty:
             messagebox.showwarning("Export", "No data in selected range.")
             return
